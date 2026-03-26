@@ -8,30 +8,33 @@ Some features (e.g., scheduling hints like `sched_barrier`) require the [AMD Glu
 <small>
 <table>
 <tr>
-  <th rowspan="2">Kernel</th><th rowspan="2">Op</th><th rowspan="2">Arch</th><th rowspan="2">Constraints</th>
-  <th rowspan="2">Typical Test</th>
-  <th colspan="3">Perf of the Typical Test</th>
+  <th rowspan="3">Kernel</th><th rowspan="3">Op</th><th rowspan="3">Arch</th><th rowspan="3">Constraints</th>
+  <th rowspan="3">Typical Test</th>
+  <th colspan="6">Perf of the Typical Test</th>
 </tr>
 <tr>
-  <th>Gluon</th><th>ASM</th><th>CK</th>
+  <th colspan="2">Gluon</th><th colspan="2">ASM</th><th colspan="2">CK</th>
+</tr>
+<tr>
+  <th>gfx942</th><th>gfx950</th><th>gfx942</th><th>gfx950</th><th>gfx942</th><th>gfx950</th>
 </tr>
 <tr>
   <td><code>gemm_a8w8</code></td><td>GEMM</td><td>CDNA4</td>
   <td nowrap>A: int8/fp8 (e4m3/e5m2)<br>B: int8/fp8 (e4m3/e5m2)<br>Out: bf16/fp16<br>Tunable BLOCK_M/N/K</td>
   <td>python op_tests/triton_tests/<br>gemm/basic/test_gemm_a8w8.py</td>
-  <td>TBD</td><td>—</td><td>TBD</td>
+  <td>TBD</td><td>TBD</td><td>—</td><td>—</td><td>TBD</td><td>TBD</td>
 </tr>
 <tr>
   <td><code>mla_decode_gluon</code></td><td>MLA<br>Decode</td><td>CDNA4</td>
   <td nowrap>Q: bf16, KV: bf16, Out: bf16<br>PAGE_SIZE=1, BLOCK_H=64<br>seq_len &gt; 192<br>nhead % 64 == 0<br>KV buf &le; 4 GB for zero-copy</td>
   <td>python op_tests/test_mla.py<br>-c 4096 -b 128 -n 128,1<br>-d bf16 -kvd bf16</td>
-  <td>~530<br>TFLOPS</td><td>~435<br>TFLOPS</td><td>—</td>
+  <td>—</td><td>~530<br>TFLOPS</td><td>—</td><td>~435<br>TFLOPS</td><td>—</td><td>—</td>
 </tr>
 <tr>
   <td><code>pa_decode_gluon</code></td><td>Paged Attn<br>Decode</td><td>CDNA3<br>CDNA4</td>
   <td nowrap>Q: fp8/bf16/fp16<br>KV: fp8/bf16/fp16<br>Out: bf16 or match<br>query_len &le; 4<br>query_len &times; group_size &le; 64<br>ctx_partition = 256</td>
-  <td>python op_tests/triton_tests/<br>test_pa_decode_gluon.py</td>
-  <td>TBD</td><td>TBD</td><td>TBD</td>
+  <td>python op_tests/triton_tests/<br>test_pa_decode_gluon.py<br>-n 8,1 -q 1 -b 3 -c 1027 -d 128<br>--block_size 16 --quant_mode per_token<br>--kv_varlen False --trans_v False<br>--use_torch_flash_ref False<br>--use_aot_impl False</td>
+  <td>~11.80 us</td><td>~10.14 us</td><td>~12.08 us</td><td>~10.26 us</td><td>—</td><td>—</td>
 </tr>
 </table>
 </small>

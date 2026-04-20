@@ -1,0 +1,6 @@
+[build-system]
+requires = ["wheel-stub"]
+build-backend = "wheel_stub.buildapi"
+
+[tool.wheel_stub]
+index_url = "https://rocm.frameworks-nightlies.amd.com/whl/gfx942-gfx950/"

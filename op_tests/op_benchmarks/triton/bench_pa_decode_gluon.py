@@ -1,4 +1,6 @@
 import argparse
+import os
+import sys
 import torch
 import triton
 import aiter
@@ -44,25 +46,31 @@ def bench_pa_decode_gluon_fn(
     metric,
     kv_varlen=False,
 ):
-    result = run_pa_gluon_test(
-        context_length=context_length,
-        batch_size=batch_size,
-        num_heads=num_heads,
-        head_size=head_size,
-        block_size=block_size,
-        compute_type=compute_type,
-        query_length=query_length,
-        quant_mode=quant_mode,
-        context_partition_size=256,
-        trans_v=False,
-        kv_varlen=kv_varlen,
-        use_aot_impl=use_aot_impl,
-        quant_q=quant_q,
-        quant_kv=quant_kv,
-        use_sinks=use_sinks,
-        sliding_window=sliding_window,
-        ps=ps,
-    )
+    old_stdout = sys.stdout
+    sys.stdout = open(os.devnull, "w")
+    try:
+        result = run_pa_gluon_test(
+            context_length=context_length,
+            batch_size=batch_size,
+            num_heads=num_heads,
+            head_size=head_size,
+            block_size=block_size,
+            compute_type=compute_type,
+            query_length=query_length,
+            quant_mode=quant_mode,
+            context_partition_size=256,
+            trans_v=False,
+            kv_varlen=kv_varlen,
+            use_aot_impl=use_aot_impl,
+            quant_q=quant_q,
+            quant_kv=quant_kv,
+            use_sinks=use_sinks,
+            sliding_window=sliding_window,
+            ps=ps,
+        )
+    finally:
+        sys.stdout.close()
+        sys.stdout = old_stdout
     if metric == "time":
         return result["us_gluon"] / 1000.0
     elif metric == "bandwidth":

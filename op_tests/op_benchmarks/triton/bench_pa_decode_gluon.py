@@ -1,4 +1,5 @@
 import argparse
+import contextlib
 import os
 import sys
 import torch
@@ -9,10 +10,13 @@ from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     print_vgpr,
 )
 from op_tests.triton_tests.test_pa_decode_gluon import run_pa_gluon_test
+import op_tests.triton_tests.test_pa_decode_gluon as _test_module
 from csrc.cpp_itfs.pa_gluon_aot.pa_decode_gluon_aot_prebuild import (
     prebuild_normal_performance_cases_aot_so,
     get_so_files_size_and_count,
 )
+
+_test_module.USE_TORCH_FLASH_REF = False
 
 
 arg_to_compute_type = {
@@ -46,9 +50,8 @@ def bench_pa_decode_gluon_fn(
     metric,
     kv_varlen=False,
 ):
-    old_stdout = sys.stdout
-    sys.stdout = open(os.devnull, "w")
-    try:
+    devnull = open(os.devnull, "w")
+    with contextlib.redirect_stdout(devnull), contextlib.redirect_stderr(devnull):
         result = run_pa_gluon_test(
             context_length=context_length,
             batch_size=batch_size,
@@ -68,9 +71,7 @@ def bench_pa_decode_gluon_fn(
             sliding_window=sliding_window,
             ps=ps,
         )
-    finally:
-        sys.stdout.close()
-        sys.stdout = old_stdout
+    devnull.close()
     if metric == "time":
         return result["us_gluon"] / 1000.0
     elif metric == "bandwidth":

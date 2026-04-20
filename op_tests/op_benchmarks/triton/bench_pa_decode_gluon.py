@@ -1,5 +1,8 @@
-import argparse
 import os
+os.environ.setdefault("AITER_LOG_LEVEL", "WARNING")
+
+import argparse
+import logging
 import sys
 import torch
 import triton
@@ -16,6 +19,9 @@ from csrc.cpp_itfs.pa_gluon_aot.pa_decode_gluon_aot_prebuild import (
 )
 
 _test_module.USE_TORCH_FLASH_REF = False
+logging.getLogger("aiter").setLevel(logging.WARNING)
+for h in logging.getLogger("aiter").handlers:
+    h.setLevel(logging.WARNING)
 
 
 arg_to_compute_type = {
@@ -29,6 +35,32 @@ def get_quant_flags(compute_type_str):
     if compute_type_str == "fp8":
         return True, True
     return False, False
+
+
+class _suppress_output:
+    def __enter__(self):
+        self._saved_stdout = sys.stdout
+        self._saved_stderr = sys.stderr
+        self._devnull = open(os.devnull, "w")
+        self._saved_stdout_fd = os.dup(1)
+        self._saved_stderr_fd = os.dup(2)
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os.dup2(self._devnull.fileno(), 1)
+        os.dup2(self._devnull.fileno(), 2)
+        sys.stdout = self._devnull
+        sys.stderr = self._devnull
+        return self
+
+    def __exit__(self, *exc):
+        os.dup2(self._saved_stdout_fd, 1)
+        os.dup2(self._saved_stderr_fd, 2)
+        os.close(self._saved_stdout_fd)
+        os.close(self._saved_stderr_fd)
+        sys.stdout = self._saved_stdout
+        sys.stderr = self._saved_stderr
+        self._devnull.close()
+        return False
 
 
 def bench_pa_decode_gluon_fn(
@@ -49,14 +81,7 @@ def bench_pa_decode_gluon_fn(
     metric,
     kv_varlen=False,
 ):
-    devnull_fd = os.open(os.devnull, os.O_WRONLY)
-    saved_stdout_fd = os.dup(1)
-    saved_stderr_fd = os.dup(2)
-    os.dup2(devnull_fd, 1)
-    os.dup2(devnull_fd, 2)
-    sys.stdout = os.fdopen(1, "w", closefd=False)
-    sys.stderr = os.fdopen(2, "w", closefd=False)
-    try:
+    with _suppress_output():
         result = run_pa_gluon_test(
             context_length=context_length,
             batch_size=batch_size,
@@ -76,16 +101,6 @@ def bench_pa_decode_gluon_fn(
             sliding_window=sliding_window,
             ps=ps,
         )
-    finally:
-        sys.stdout.flush()
-        sys.stderr.flush()
-        os.dup2(saved_stdout_fd, 1)
-        os.dup2(saved_stderr_fd, 2)
-        os.close(saved_stdout_fd)
-        os.close(saved_stderr_fd)
-        os.close(devnull_fd)
-        sys.stdout = os.fdopen(1, "w", closefd=False)
-        sys.stderr = os.fdopen(2, "w", closefd=False)
     if metric == "time":
         return result["us_gluon"] / 1000.0
     elif metric == "bandwidth":
@@ -109,10 +124,15 @@ def get_x_vals_sliding_window():
     return vals
 
 
+COMPUTE_TYPES_QUANT_Q_AND_KV_OPTIONS = [
+    ("fp8", aiter.dtypes.fp8, True, True),
+    ("bf16", torch.bfloat16, False, False),
+]
+
+
 def run_normal_benchmark(args, use_aot_impl=False):
-    compute_type = arg_to_compute_type[args.compute_type]
-    quant_q, quant_kv = get_quant_flags(args.compute_type)
-    num_heads = tuple(args.num_heads)
+    head_dim = args.head_dim if args.head_dim is not None else 128
+    num_heads = tuple(args.num_heads) if args.num_heads is not None else (64, 4)
 
     if args.batch_size and args.context_length:
         x_vals = [(args.batch_size, args.context_length)]
@@ -122,46 +142,57 @@ def run_normal_benchmark(args, use_aot_impl=False):
     mode_name = "normal_aot" if use_aot_impl else "normal"
     plot_name = f"{get_caller_name_no_ext()}_{mode_name}"
 
-    for block_size in ([args.block_size] if args.block_size else [16, 64]):
-        benchmark = triton.testing.Benchmark(
-            x_names=["batch_size", "context_length"],
-            x_vals=x_vals,
-            line_arg="metric",
-            line_vals=["time", "bandwidth"],
-            line_names=["Time_(ms)", "Bandwidth_(TB/s)"],
-            styles=[("red", "-"), ("blue", "-")],
-            ylabel="ms / TB/s",
-            plot_name=f"{plot_name}_bs{block_size}",
-            args={},
-        )
+    query_lengths = [args.query_length] if args.query_length else [1, 4]
 
-        @triton.testing.perf_report([benchmark])
-        def bench(batch_size, context_length, metric, **kwargs):
-            return bench_pa_decode_gluon_fn(
-                batch_size=batch_size,
-                context_length=context_length,
-                num_heads=num_heads,
-                head_size=args.head_dim,
-                block_size=block_size,
-                compute_type=compute_type,
-                query_length=args.query_length,
-                quant_mode=args.quant_mode,
-                quant_q=quant_q,
-                quant_kv=quant_kv,
-                use_aot_impl=use_aot_impl,
-                use_sinks=False,
-                sliding_window=0,
-                ps=False,
-                metric=metric,
-            )
+    if args.compute_type:
+        ct_options = [(args.compute_type, arg_to_compute_type[args.compute_type],
+                       *get_quant_flags(args.compute_type))]
+    else:
+        ct_options = COMPUTE_TYPES_QUANT_Q_AND_KV_OPTIONS
 
-        bench.run(save_path="." if args.o else None, print_data=True)
+    for ct_name, compute_type, quant_q, quant_kv in ct_options:
+        for block_size in ([args.block_size] if args.block_size else [16, 64]):
+            for ql in query_lengths:
+                benchmark = triton.testing.Benchmark(
+                    x_names=["batch_size", "context_length"],
+                    x_vals=x_vals,
+                    line_arg="metric",
+                    line_vals=["time", "bandwidth"],
+                    line_names=["Time_(ms)", "Bandwidth_(TB/s)"],
+                    styles=[("red", "-"), ("blue", "-")],
+                    ylabel="ms / TB/s",
+                    plot_name=f"{plot_name}_{ct_name}_blk{block_size}_ql{ql}",
+                    args={},
+                )
+
+                @triton.testing.perf_report([benchmark])
+                def bench(batch_size, context_length, metric,
+                          _ql=ql, _compute_type=compute_type,
+                          _quant_q=quant_q, _quant_kv=quant_kv, **kwargs):
+                    return bench_pa_decode_gluon_fn(
+                        batch_size=batch_size,
+                        context_length=context_length,
+                        num_heads=num_heads,
+                        head_size=head_dim,
+                        block_size=block_size,
+                        compute_type=_compute_type,
+                        query_length=_ql,
+                        quant_mode=args.quant_mode,
+                        quant_q=_quant_q,
+                        quant_kv=_quant_kv,
+                        use_aot_impl=use_aot_impl,
+                        use_sinks=False,
+                        sliding_window=0,
+                        ps=False,
+                        metric=metric,
+                    )
+
+                bench.run(save_path="." if args.o else None, print_data=True)
 
 
 def run_sliding_window_benchmark(args):
-    compute_type = arg_to_compute_type[args.compute_type]
-    quant_q, quant_kv = get_quant_flags(args.compute_type)
-    num_heads = tuple(args.num_heads)
+    head_dim = args.head_dim if args.head_dim is not None else 64
+    num_heads = tuple(args.num_heads) if args.num_heads is not None else (64, 8)
 
     if args.batch_size and args.context_length:
         x_vals = [(args.batch_size, args.context_length)]
@@ -170,64 +201,76 @@ def run_sliding_window_benchmark(args):
 
     plot_name = f"{get_caller_name_no_ext()}_sliding_window"
 
-    for use_sinks in [False, True]:
-        for sliding_window in [0, 128]:
-            benchmark = triton.testing.Benchmark(
-                x_names=["batch_size", "context_length"],
-                x_vals=x_vals,
-                line_arg="metric",
-                line_vals=["time", "bandwidth"],
-                line_names=["Time_(ms)", "Bandwidth_(TB/s)"],
-                styles=[("red", "-"), ("blue", "-")],
-                ylabel="ms / TB/s",
-                plot_name=f"{plot_name}_sinks{use_sinks}_sw{sliding_window}",
-                args={},
-            )
+    if args.compute_type:
+        ct_options = [(args.compute_type, arg_to_compute_type[args.compute_type],
+                       *get_quant_flags(args.compute_type))]
+    else:
+        ct_options = COMPUTE_TYPES_QUANT_Q_AND_KV_OPTIONS
 
-            @triton.testing.perf_report([benchmark])
-            def bench(
-                batch_size,
-                context_length,
-                metric,
-                _use_sinks=use_sinks,
-                _sliding_window=sliding_window,
-                **kwargs,
-            ):
-                return bench_pa_decode_gluon_fn(
-                    batch_size=batch_size,
-                    context_length=context_length,
-                    num_heads=num_heads,
-                    head_size=args.head_dim,
-                    block_size=args.block_size or 16,
-                    compute_type=compute_type,
-                    query_length=args.query_length,
-                    quant_mode=args.quant_mode,
-                    quant_q=quant_q,
-                    quant_kv=quant_kv,
-                    use_aot_impl=False,
-                    use_sinks=_use_sinks,
-                    sliding_window=_sliding_window,
-                    ps=True,
-                    metric=metric,
-                    kv_varlen=True,
+    for ct_name, compute_type, quant_q, quant_kv in ct_options:
+        for use_sinks in [False, True]:
+            for sliding_window in [0, 128]:
+                benchmark = triton.testing.Benchmark(
+                    x_names=["batch_size", "context_length"],
+                    x_vals=x_vals,
+                    line_arg="metric",
+                    line_vals=["time", "bandwidth"],
+                    line_names=["Time_(ms)", "Bandwidth_(TB/s)"],
+                    styles=[("red", "-"), ("blue", "-")],
+                    ylabel="ms / TB/s",
+                    plot_name=f"{plot_name}_{ct_name}_sinks{use_sinks}_sw{sliding_window}",
+                    args={},
                 )
 
-            bench.run(save_path="." if args.o else None, print_data=True)
+                @triton.testing.perf_report([benchmark])
+                def bench(
+                    batch_size,
+                    context_length,
+                    metric,
+                    _use_sinks=use_sinks,
+                    _sliding_window=sliding_window,
+                    _compute_type=compute_type,
+                    _quant_q=quant_q,
+                    _quant_kv=quant_kv,
+                    **kwargs,
+                ):
+                    return bench_pa_decode_gluon_fn(
+                        batch_size=batch_size,
+                        context_length=context_length,
+                        num_heads=num_heads,
+                        head_size=head_dim,
+                        block_size=args.block_size or 16,
+                        compute_type=_compute_type,
+                        query_length=args.query_length or 1,
+                        quant_mode=args.quant_mode,
+                        quant_q=_quant_q,
+                        quant_kv=_quant_kv,
+                        use_aot_impl=False,
+                        use_sinks=_use_sinks,
+                        sliding_window=_sliding_window,
+                        ps=True,
+                        metric=metric,
+                        kv_varlen=True,
+                    )
+
+                bench.run(save_path="." if args.o else None, print_data=True)
 
 
 def run_benchmark(args):
     if args.mode == "normal":
         run_normal_benchmark(args, use_aot_impl=False)
     elif args.mode == "normal_aot":
-        prebuild_normal_performance_cases_aot_so()
-        get_so_files_size_and_count()
+        with _suppress_output():
+            prebuild_normal_performance_cases_aot_so()
+            get_so_files_size_and_count()
         run_normal_benchmark(args, use_aot_impl=True)
     elif args.mode == "sliding_window":
         run_sliding_window_benchmark(args)
     elif args.mode == "all":
         run_normal_benchmark(args, use_aot_impl=False)
-        prebuild_normal_performance_cases_aot_so()
-        get_so_files_size_and_count()
+        with _suppress_output():
+            prebuild_normal_performance_cases_aot_so()
+            get_so_files_size_and_count()
         run_normal_benchmark(args, use_aot_impl=True)
         run_sliding_window_benchmark(args)
     else:
@@ -242,16 +285,16 @@ def parse_args():
     parser.add_argument(
         "--mode",
         type=str,
-        default="normal",
+        default="all",
         choices=["normal", "normal_aot", "sliding_window", "all"],
         help="Benchmark mode: normal, normal_aot, sliding_window, or all.",
     )
     parser.add_argument(
         "--compute_type",
         type=str,
-        default="fp8",
+        default=None,
         choices=["fp8", "bf16", "fp16"],
-        help="Compute type.",
+        help="Compute type. Default: sweep [fp8, bf16].",
     )
     parser.add_argument(
         "--block_size",
@@ -275,8 +318,8 @@ def parse_args():
     parser.add_argument(
         "--query_length",
         type=int,
-        default=1,
-        help="Query sequence length.",
+        default=None,
+        help="Query sequence length. Default: sweep [1, 4] for normal modes, 1 for sliding_window.",
     )
     parser.add_argument(
         "--quant_mode",
@@ -310,14 +353,6 @@ def parse_args():
         help="Print VGPR usage for Triton kernels.",
     )
     args = parser.parse_args()
-
-    if args.head_dim is None:
-        args.head_dim = 64 if args.mode == "sliding_window" else 128
-    if args.num_heads is None:
-        if args.mode == "sliding_window":
-            args.num_heads = [64, 8]
-        else:
-            args.num_heads = [64, 4]
 
     return args
 

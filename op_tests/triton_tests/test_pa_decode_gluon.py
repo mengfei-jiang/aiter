@@ -14,7 +14,7 @@ import triton
 import aiter
 from aiter import dtypes
 from aiter import pertoken_quant, per_tensor_quant
-from aiter.test_common import benchmark, checkAllclose, perftest
+from aiter.test_common import checkAllclose, perftest
 import aiter.ops.triton.utils._triton.arch_info as arch_info
 from aiter.ops.attention import pa_decode_gluon
 from aiter.ops.triton.gluon.pa_decode_gluon import (
@@ -1234,7 +1234,6 @@ def run_gluon_kernel(
             )
 
 
-@benchmark()
 def run_pa_gluon_test(
     context_length: int,
     batch_size: int,
@@ -1258,7 +1257,18 @@ def run_pa_gluon_test(
     data_type = compute_type
     if compute_type == aiter.dtypes.fp8:
         data_type = torch.bfloat16
-    results = {}
+    results = {
+        "context_length": context_length,
+        "batch_size": batch_size,
+        "num_heads": num_heads,
+        "head_size": head_size,
+        "block_size": block_size,
+        "compute_type": compute_type,
+        "query_length": query_length,
+        "quant_mode": quant_mode,
+        "quant_q": quant_q,
+        "quant_kv": quant_kv,
+    }
     seed = 123
     # seed = 371
     setup_seed(seed)
@@ -1884,27 +1894,6 @@ def _run_single_test(args):
         Dictionary containing test results
     """
     test_config, current, total = args
-
-    print(
-        f"\n[{current}/{total}] Testing: "
-        f"use_torch_flash_ref={test_config['use_torch_flash_ref']}, "
-        f"compute_type={test_config['compute_type']}, "
-        f"quant_q_and_kv=({test_config['quant_q']}, {test_config['quant_kv']}), "
-        f"use_aot_impl={test_config['use_aot_impl']}, "
-        f"trans_v={test_config['trans_v']}, "
-        f"kv_varlen={test_config['kv_varlen']}, "
-        f"context_partition_size={test_config['context_partition_size']}, "
-        f"quant_mode={test_config['quant_mode']}, "
-        f"block_size={test_config['block_size']}, "
-        f"num_heads={test_config['num_heads']}, "
-        f"context_lengths={test_config['context_length']}, "
-        f"batch_size={test_config['batch_size']}, "
-        f"query_length={test_config['query_length']}, "
-        f"head_size={test_config['head_size']}, "
-        f"sinks={test_config['sinks']}, "
-        f"sliding_window={test_config['sliding_window']},"
-        f"ps={test_config['ps']}"
-    )
 
     # Import global variables to modify them
     global USE_TORCH_FLASH_REF

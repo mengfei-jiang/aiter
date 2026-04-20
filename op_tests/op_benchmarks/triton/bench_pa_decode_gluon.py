@@ -1,5 +1,4 @@
 import argparse
-import contextlib
 import os
 import sys
 import torch
@@ -50,8 +49,14 @@ def bench_pa_decode_gluon_fn(
     metric,
     kv_varlen=False,
 ):
-    devnull = open(os.devnull, "w")
-    with contextlib.redirect_stdout(devnull), contextlib.redirect_stderr(devnull):
+    devnull_fd = os.open(os.devnull, os.O_WRONLY)
+    saved_stdout_fd = os.dup(1)
+    saved_stderr_fd = os.dup(2)
+    os.dup2(devnull_fd, 1)
+    os.dup2(devnull_fd, 2)
+    sys.stdout = os.fdopen(1, "w", closefd=False)
+    sys.stderr = os.fdopen(2, "w", closefd=False)
+    try:
         result = run_pa_gluon_test(
             context_length=context_length,
             batch_size=batch_size,
@@ -71,7 +76,16 @@ def bench_pa_decode_gluon_fn(
             sliding_window=sliding_window,
             ps=ps,
         )
-    devnull.close()
+    finally:
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os.dup2(saved_stdout_fd, 1)
+        os.dup2(saved_stderr_fd, 2)
+        os.close(saved_stdout_fd)
+        os.close(saved_stderr_fd)
+        os.close(devnull_fd)
+        sys.stdout = os.fdopen(1, "w", closefd=False)
+        sys.stderr = os.fdopen(2, "w", closefd=False)
     if metric == "time":
         return result["us_gluon"] / 1000.0
     elif metric == "bandwidth":

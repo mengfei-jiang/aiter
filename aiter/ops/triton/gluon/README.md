@@ -42,10 +42,21 @@ Some features (e.g., scheduling hints like `sched_barrier`) require the [AMD Glu
   <td>~4.68<br>TB/s</td><td>—</td><td>—</td>
 </tr>
 <tr>
-  <td><code>pa_decode_gluon</code></td><td>Paged Attn<br>Decode</td><td>CDNA3<br>CDNA4</td>
-  <td nowrap>Q: fp8/bf16/fp16<br>KV: fp8/bf16/fp16<br>Out: bf16 or match<br>query_len &le; 4<br>query_len &times; group_size &le; 64<br>ctx_partition = 256</td>
-  <td>python op_tests/triton_tests/<br>test_pa_decode_gluon.py</td>
-  <td>TBD</td><td>TBD</td><td>TBD</td>
+  <td rowspan="4"><code>pa_decode_gluon</code></td><td rowspan="4">Paged Attn<br>Decode</td>
+  <td rowspan="2">CDNA3</td>
+  <td nowrap>(PS, default)<br>Q: fp8_e4m3fnuz/bf16/fp16<br>KV: fp8_e4m3fnuz/bf16/fp16<br>Out: bf16/fp16<br>query_len &le; 4<br>query_len &times; group_size &le; 64<br>ctx_partition = 256<br>kv_block &isin; {16, 64, 1024}<br>quant: per-tensor/per-token<br>MFMA: 16&times;16&times;16 (bf16/fp16),<br>16&times;16&times;32 (fp8)</td>
+  <td rowspan="4">python op_tests/triton_tests/<br>test_pa_decode_gluon.py</td>
+  <td colspan="2" rowspan="4"><a href="#gluon-vs-asm-perf-gfx950-block_size16-psfalse-qlen1">see below</a></td><td rowspan="4">—</td>
+</tr>
+<tr>
+  <td nowrap>(non-PS, ps=False)<br>Same dtypes as above<br>kv_block: 16/64 (dot) or 1024 (large)</td>
+</tr>
+<tr>
+  <td rowspan="2">CDNA4</td>
+  <td nowrap>(PS, default)<br>Q: fp8_e4m3fn/bf16/fp16<br>KV: fp8_e4m3fn/bf16/fp16<br>Out: bf16/fp16<br>query_len &le; 4<br>query_len &times; group_size &le; 64<br>ctx_partition = 256<br>kv_block &isin; {16, 64, 1024}<br>quant: per-tensor/per-token<br>MFMA: 16&times;16&times;16 (bf16/fp16),<br>16&times;16&times;32 (fp8)</td>
+</tr>
+<tr>
+  <td nowrap>(non-PS, ps=False)<br>Same dtypes as above<br>kv_block: 16/64 (dot) or 1024 (large)</td>
 </tr>
 </table>
 </small>
@@ -172,16 +183,81 @@ python op_tests/test_mla.py -c 10000 100000 -b 1 3 4 -n 16,1 -d bf16 -kvd bf16 -
 
 ### `pa_decode_gluon.py` — Paged Attention Decode
 
-**Function:** `pa_decode_gluon(output, query, key_cache, value_cache, context_lengths, block_tables, softmax_scale, query_length, max_context_partition_num, context_partition_size, compute_type, query_scale, key_scale, value_scale, ...)`
+**Function:** `pa_decode_gluon(output, query, key_cache, value_cache, context_lengths, block_tables, softmax_scale, query_length, max_context_partition_num, context_partition_size=256, compute_type=bf16, query_scale=None, key_scale=None, value_scale=None, ..., sinks=None, sliding_window=0, ps=True)`
 
-**Description:** Paged attention decode with partitioned KV (first pass + reduction). Supports MTP (multi-token prefill, query_length &le; 4), sliding window, ALiBi, causal masking. Three inner kernel variants for different KV block sizes.
+**Description:** Paged attention decode with partitioned KV (stage-1 attention + stage-2 reduction). Supports GQA, MTP (query_length &le; 4), sliding window, attention sinks, and causal masking. Dispatches to four stage-1 kernel variants by `(ps, num_kv_heads, KV_BLOCK_SIZE)`:
+
+| Kernel | Condition | Features |
+|--------|-----------|----------|
+| `_sliding_window` | ps=True, kv_heads &ge; 2 | **Default.** PS dynamic split, double-buffered key prefetch, ONE_SHOT, fp8 dynamic quant |
+| `_sliding_window_head_1` | ps=True, kv_heads == 1 | Single KV-head opt, MTP split across program_id(1) |
+| `_v2_gluon_dot_kernel` | ps=False, blk &isin; {16,64} | Fixed-partition grid, single-program sliding window |
+| `_v2_gluon_large_block_dot_kernel` | ps=False, blk=1024 | Large-block variant with sub-block loop |
+
+Stage-2 reduce has three implementations (tried in order): **C++ HIP** (wave-level shuffle reduce, &le;64 partitions), **FlyDSL** (MLIR-compiled, any partition count), and **Triton** (pure Triton fallback). The first available one is used.
 
 | Parameter | Details |
 |-----------|---------|
-| Arch | gfx942 (CDNA3) and gfx950 (CDNA4) |
-| Q dtype | fp8_e4m3fnuz, bf16, fp16 |
-| KV dtype | fp8_e4m3fnuz, bf16, fp16 |
-| Output | bf16 (fp8 mode), or matches compute_type |
-| KV block sizes | 16, 64, 1024 (selected by kernel variant) |
-| Context partition | 256 (static_assert) |
-| Constraint | `query_length * query_group_size` &le; 64 |
+| Arch | gfx942 (CDNA3), gfx950 (CDNA4) |
+| Q/KV dtype | fp8, bf16, fp16 |
+| Output | bf16/fp16 |
+| Quant | per-tensor or per-token |
+| KV block sizes | 16, 64, 1024 |
+| query_length | 1..4 (MTP), query_length &times; group_size &le; 64 |
+| Value layout | Non-transposed or transposed |
+| Sliding window | 0 (disabled) or >0 |
+| Sinks | Optional; added to softmax denominator only |
+| ONE_SHOT | Auto when partitions &le; 1; skips reduce |
+
+#### Gluon vs ASM perf (MI350, block_size=16, ps=False, qlen=1)
+
+Gluon `_dot_kernel` vs hand-written assembly `pa_fwd_asm` (non-PS path; Gluon uses Triton reduce):
+
+```
+python -m pytest op_tests/triton_tests/test_pa_decode_gluon.py -k "gluon_vs_asm_performance" -s
+```
+
+**Perf** (MI350, ctx=8192, batch=4/8, block_size=16, ps=False, qlen=1):
+
+**bf16 (no quant):**
+
+| heads | batch | ct&times; | Gluon (us) | ASM (us) | ASM/Gluon |
+|-------|-------|-----|-----------|---------|-----------|
+| (8,1) | 4 | 8192 | 13.67 | 43.16 | 3.16&times; |
+| (8,1) | 8 | 8192 | 16.63 | 43.89 | 2.64&times; |
+| (16,1) | 4 | 8192 | 13.65 | 46.62 | 3.41&times; |
+| (16,1) | 8 | 8192 | 16.95 | 46.68 | 2.75&times; |
+
+**fp8 (per-token quant):**
+
+| heads | batch | ct&times; | Gluon (us) | ASM (us) | ASM/Gluon |
+|-------|-------|-----|-----------|---------|-----------|
+| (8,1) | 4 | 8192 | 13.55 | 36.58 | 2.70&times; |
+| (8,1) | 8 | 8192 | 14.93 | 37.00 | 2.48&times; |
+| (16,1) | 4 | 8192 | 13.45 | 43.90 | 3.26&times; |
+| (16,1) | 8 | 8192 | 14.96 | 44.25 | 2.96&times; |
+
+#### Gluon vs ASM perf (MI350, block_size=1024, ps=True, qlen=1)
+
+Gluon `_sliding_window` vs hand-written assembly `pa_persistent_fwd` (PS path):
+
+**Perf** (MI350, ctx=2048, fp8 per-token, block_size=1024, ps=True, qlen=1; Gluon uses Triton reduce):
+
+| heads | batch | ct&times; | Gluon (us) | ASM (us) | ASM/Gluon |
+|-------|-------|-----|-----------|---------|-----------|
+| (16,1) | 1 | 2048 | 11.20 | 12.76 | 1.14&times; |
+| (64,8) | 4 | 2048 | 13.31 | 14.41 | 1.08&times; |
+| (128,16) | 4 | 2048 | 17.13 | 18.34 | 1.07&times; |
+
+#### Why Gluon over standard Triton
+
+Compared to `aiter/ops/triton/attention/pa_decode.py`:
+
+1. **Explicit MFMA control** — `gl.amd.cdna3.mfma` with exact instruction shape and operand layout, vs `tl.dot` relying on compiler
+2. **Hardware-aware memory layout** — `SwizzledSharedLayout` (no LDS bank conflict), `BlockedLayout`/`DistributedLinearLayout` (optimal register placement)
+3. **Instruction scheduling hints** — `sched_barrier`/`sched_group_barrier` overlapping VMEM load with MFMA compute (requires [AMD Gluon Extension](https://github.com/ROCm/triton/tree/gluon_ext))
+4. **Double-buffered key prefetch** — manual pipeline hiding memory latency across iterations; Triton cannot auto-stage through indirect block table lookups
+5. **Buffer resource instructions** — `gl.amd.cdna3.buffer_load`/`buffer_store` use AMD buffer resource descriptors (`__builtin_amdgcn_make_buffer_rsrc`): scalar base + 32-bit offset addressing saves VGPRs vs 64-bit pointer arithmetic per element; the hardware buffer descriptor provides automatic bounds checking without software mask branches; cache modifiers (`.cg` for non-temporal streaming access) improve L2 utilization for large KV caches that are read once and not reused
+6. **PS dynamic work distribution** — balanced workloads across variable-length sequences vs fixed-partition grid waste
+7. **ONE_SHOT fast path** — short sequences skip reduce kernel and intermediate buffers entirely
+8. **Unified kernel** — 4 variants via `gl.constexpr` vs 12 separate Triton kernel functions for (V1/V2, dot/no-dot, per-tensor/per-token)

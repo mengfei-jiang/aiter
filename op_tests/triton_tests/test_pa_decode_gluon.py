@@ -16,7 +16,7 @@ from aiter import dtypes
 from aiter import pertoken_quant, per_tensor_quant
 from aiter.test_common import benchmark, checkAllclose, perftest
 import aiter.ops.triton.utils._triton.arch_info as arch_info
-from aiter.ops.attention import pa_decode_gluon
+from aiter.ops.attention import pa_decode_gluon, pa_fwd_asm
 from aiter.ops.triton.gluon.pa_decode_gluon import (
     get_recommended_splits,
 )
@@ -77,12 +77,14 @@ SINKS_OPTIONS = [True, False]
 SLIDING_WINDOW_OPTIONS = [0, 128]
 COMPUTE_TYPES_QUANT_Q_AND_KV_OPTIONS = []
 PS_OPTIONS = [True, False]
+ENABLE_PS_ASSEMBLY = False
 
 CASE_SET_NAME_OPTIONS = [
     "normal_accuracy",
     "normal_accuracy_aot",
     "sliding_window_accuracy",
     "sliding_window_performance",
+    "gluon_vs_asm_performance",
 ]
 
 
@@ -1638,18 +1640,28 @@ def run_pa_gluon_test(
 
     # Test Assembly (PA Persistent Scheduling)
     query_group_size = num_query_heads // num_kv_heads
-    skip_assembly = (
-        (block_size != 1024)
-        or (block_size == 1024 and arch_info.get_arch() in ["gfx950"])
-        or (block_size == 16 and query_group_size == 8 and query_length == 3)
-        or (query_group_size == 5 and query_length == 3)
-        or (block_size == 64)
-        or (not quant_kv)
-        or (compute_type == torch.float16 and (quant_q or quant_kv))
-        or (head_size not in [128])
-        or (sliding_window > 0)
-        or True
-    )
+    if ENABLE_PS_ASSEMBLY:
+        skip_assembly = (
+            (block_size not in [256, 1024])
+            or (query_group_size == 5 and query_length == 3)
+            or (not quant_kv)
+            or (compute_type == torch.float16 and (quant_q or quant_kv))
+            or (head_size not in [128])
+            or (sliding_window > 0)
+        )
+    else:
+        skip_assembly = (
+            (block_size != 1024)
+            or (block_size == 1024 and arch_info.get_arch() in ["gfx950"])
+            or (block_size == 16 and query_group_size == 8 and query_length == 3)
+            or (query_group_size == 5 and query_length == 3)
+            or (block_size == 64)
+            or (not quant_kv)
+            or (compute_type == torch.float16 and (quant_q or quant_kv))
+            or (head_size not in [128])
+            or (sliding_window > 0)
+            or True
+        )
 
     if quant_kv and quant_mode == "per_tensor":
         key_scale_original = key_scale_factors_flat.contiguous()
@@ -1758,6 +1770,54 @@ def run_pa_gluon_test(
         results["perf_gluon_vs_asm"] = f'{results["us_asm"] / results["us_gluon"]:.0%}'
     else:
         results["perf_gluon_vs_asm"] = "NaN"
+
+    # Test Assembly non-PS path (pa_fwd_asm)
+    # Only runs when gluon is also non-PS (ps=False) for fair comparison
+    skip_asm_non_ps = ps or (head_size not in [128]) or (sliding_window > 0)
+    if not skip_asm_non_ps:
+        asm_np_values = quantized_values
+        if asm_np_values.ndim == 4:
+            x = 16 // asm_np_values.element_size()
+            nb, nh, hs, bs_ = asm_np_values.shape
+            asm_np_values = (
+                asm_np_values.view(nb, nh, hs, bs_ // x, x)
+                .permute(0, 1, 3, 2, 4)
+                .contiguous()
+            )
+        asm_np_output = torch.empty_like(query)
+        try:
+
+            @perftest()
+            def run_asm_non_ps():
+                pa_fwd_asm(
+                    Q=query,
+                    K=quantized_keys,
+                    V=asm_np_values,
+                    block_tables=block_tables,
+                    context_lens=context_lengths,
+                    block_tables_stride0=block_tables.stride(0),
+                    max_qlen=max_query_length,
+                    K_QScale=key_scale_original,
+                    V_QScale=value_scale_original,
+                    out_=asm_np_output,
+                    qo_indptr=query_output_indptr if query_length > 1 else None,
+                )
+
+            _, asm_np_time = run_asm_non_ps()
+            print("\nAIT_Assembly(non-PS) vs Original Ref:")
+            compare_arrays(
+                asm_np_output.to(torch.float32).detach().cpu().numpy(),
+                reference_output_quant.to(torch.float32).detach().cpu().numpy(),
+            )
+            results["us_asm_non_ps"] = asm_np_time
+            asm_np_bw = pa_rw_bytes / (asm_np_time * 1e6 * 1.024**4)
+            results["asm_non_ps_bandwith(TB/s)"] = asm_np_bw
+            results["perf_gluon_vs_asm_non_ps"] = (
+                f'{asm_np_time / results["us_gluon"]:.0%}'
+            )
+        except Exception as e:
+            print(f"\nAssembly non-PS skipped: {e}")
+            results["perf_gluon_vs_asm_non_ps"] = "NaN"
 
     sys.stdout.flush()
 
@@ -2528,6 +2588,70 @@ def sliding_window_performance_test():
     parse_arg_and_run_test()
 
 
+def gluon_vs_asm_performance_test():
+    """Run gluon vs assembly performance test.
+    Part 1 (PS): block_size=1024, fp8 per_token, ps=True
+        → gluon _sliding_window vs pa_persistent_fwd (PS assembly)
+    Part 2 (non-PS): block_size=16, bf16 no-quant, ps=False
+        → gluon _dot_kernel vs pa_fwd_asm (non-PS assembly)
+    """
+    global BLOCK_SIZE_OPTIONS
+    global QUERY_LENGTH_OPTIONS
+    global BATCH_SIZE_OPTIONS
+    global HEAD_CONFIGURATIONS
+    global CONTEXT_LENGTH_OPTIONS
+    global COMPUTE_TYPES_QUANT_Q_AND_KV_OPTIONS
+    global QUANT_MODE_OPTIONS
+    global HEAD_DIMENSION_OPTIONS
+    global SINKS_OPTIONS
+    global SLIDING_WINDOW_OPTIONS
+    global TRANS_V_OPTIONS
+    global KV_VARLEN_OPTIONS
+    global USE_TORCH_FLASH_REF_OPTIONS
+    global USE_AOT_IMPL_OPTIONS
+    global CONTEXT_PARTITION_SIZE_OPTIONS
+    global PS_OPTIONS
+    global ENABLE_PS_ASSEMBLY
+
+    USE_AOT_IMPL_OPTIONS = [False]
+    USE_TORCH_FLASH_REF_OPTIONS = [False]
+    CONTEXT_PARTITION_SIZE_OPTIONS = [256]
+    SINKS_OPTIONS = [False]
+    SLIDING_WINDOW_OPTIONS = [0]
+    TRANS_V_OPTIONS = [False]
+    KV_VARLEN_OPTIONS = [False]
+    HEAD_DIMENSION_OPTIONS = [128]
+    QUERY_LENGTH_OPTIONS = [1]
+
+    # === Part 1: PS path (gluon _sliding_window vs pa_persistent_fwd) ===
+    ENABLE_PS_ASSEMBLY = True
+    BLOCK_SIZE_OPTIONS = [1024]
+    PS_OPTIONS = [True]
+    COMPUTE_TYPES_QUANT_Q_AND_KV_OPTIONS = [["fp8", True, True]]
+    QUANT_MODE_OPTIONS = ["per_token"]
+
+    HEAD_CONFIGURATIONS = [(16, 1), (64, 8)]
+    BATCH_SIZE_OPTIONS = [1, 4]
+    CONTEXT_LENGTH_OPTIONS = [2048]
+    parse_arg_and_run_test()
+
+    ENABLE_PS_ASSEMBLY = False
+
+    # === Part 2: non-PS path (gluon _dot_kernel vs pa_fwd_asm) ===
+    BLOCK_SIZE_OPTIONS = [16]
+    PS_OPTIONS = [False]
+    COMPUTE_TYPES_QUANT_Q_AND_KV_OPTIONS = [
+        ["bf16", False, False],
+        ["fp8", True, True],
+    ]
+    QUANT_MODE_OPTIONS = ["per_token"]
+
+    HEAD_CONFIGURATIONS = [(8, 1), (16, 1)]
+    BATCH_SIZE_OPTIONS = [4, 8]
+    CONTEXT_LENGTH_OPTIONS = [8192]
+    parse_arg_and_run_test()
+
+
 @pytest.mark.parametrize("case_set_name", CASE_SET_NAME_OPTIONS)
 def test_multi_case_set(case_set_name):
     if case_set_name == "normal_accuracy":
@@ -2542,6 +2666,8 @@ def test_multi_case_set(case_set_name):
         sliding_window_accuracy_test()
     elif case_set_name == "sliding_window_performance":
         sliding_window_performance_test()
+    elif case_set_name == "gluon_vs_asm_performance":
+        gluon_vs_asm_performance_test()
 
 
 if __name__ == "__main__":
@@ -2551,3 +2677,4 @@ if __name__ == "__main__":
     # normal_performance_aot_test()
     sliding_window_accuracy_test()
     # sliding_window_performance_test()
+    # gluon_vs_asm_performance_test()

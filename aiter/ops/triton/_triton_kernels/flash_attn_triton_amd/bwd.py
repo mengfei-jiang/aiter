@@ -14,6 +14,19 @@ from .utils import (
     remap_xcd,
 )
 
+
+def _has_use_amdgpu_trackers():
+    try:
+        from triton.backends.amd.compiler import HIPOptions
+        return "use_amdgpu_trackers" in HIPOptions.__dataclass_fields__
+    except Exception:
+        return False
+
+
+_DISABLE_AMDGPU_TRACKERS = (
+    {"use_amdgpu_trackers": False} if _has_use_amdgpu_trackers() else {}
+)
+
 PREPROCESS_AUTOTUNE_KEYS = [
     "max_seqlen_q",
     "ACTUAL_HEAD_DIM",
@@ -4874,6 +4887,7 @@ def attention_backward_triton_impl(
                 DEBUG_TRITON=DEBUG_TRITON,
                 DEBUG_TRITON_DETAIL=DEBUG_TRITON_DETAIL,
                 NUM_XCD=num_xcd,
+                **_DISABLE_AMDGPU_TRACKERS,
             )
         else:
             bwd_kernel_fused_noncausal[grid](
@@ -4965,6 +4979,7 @@ def attention_backward_triton_impl(
                 DEBUG_TRITON=DEBUG_TRITON,
                 DEBUG_TRITON_DETAIL=DEBUG_TRITON_DETAIL,
                 NUM_XCD=num_xcd,
+                **_DISABLE_AMDGPU_TRACKERS,
             )
     elif mode == "fused_atomic":
         NUM_WARPS, NUM_STAGES = 4, 1

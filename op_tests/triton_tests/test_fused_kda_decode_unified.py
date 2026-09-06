@@ -22,17 +22,38 @@ DEVICE = "cuda"
 
 
 def _ref_conv1d_step(x_qkv, conv_state, conv_weight, state_len):
+    """Normal decode conv1d step (reads from positions 0..W-2, shift-appends)."""
     dim = x_qkv.shape[0]
     width = conv_weight.shape[1]
     out = torch.zeros(dim, dtype=torch.float32, device=DEVICE)
     for j in range(width - 1):
-        idx = state_len - width + 1 + j
-        out += conv_state[:, idx].float() * conv_weight[:, j].float()
+        out += conv_state[:, j].float() * conv_weight[:, j].float()
     out += x_qkv.float() * conv_weight[:, width - 1].float()
     out = out * torch.sigmoid(out)
     conv_state[:, :-1] = conv_state[:, 1:].clone()
     conv_state[:, -1] = x_qkv
     return out.to(DTYPE)
+
+
+def _ref_conv1d_step_spec(x_qkv, cols, conv_weight):
+    """Spec decode conv1d step with register-based sliding window.
+
+    Matches ATOM causal_conv1d_update: history comes from cols (registers),
+    not from the tail of conv_state.
+
+    Args:
+        cols: list of W-1 tensors [col0, col1, col2], the sliding history.
+    Returns:
+        (output, new_cols) where new_cols = [col1, col2, x_qkv].
+    """
+    width = conv_weight.shape[1]
+    out = torch.zeros_like(cols[0], dtype=torch.float32)
+    for j in range(width - 1):
+        out += cols[j].float() * conv_weight[:, j].float()
+    out += x_qkv.float() * conv_weight[:, width - 1].float()
+    out = out * torch.sigmoid(out)
+    new_cols = cols[1:] + [x_qkv.clone()]
+    return out.to(DTYPE), new_cols
 
 
 def _ref_kda_step(q_h, k_h, v_h, gate_h, dt_h, A_h, beta_val, h_state, K, lower_bound):
@@ -113,16 +134,41 @@ def _ref_decode(
             s_idx = state_indices[n, i_start].item()
             conv_slot_idx = conv_state_indices[n].item()
             b_h = state[s_idx].clone().float()
+            cols_q = [
+                conv_state[conv_slot_idx, :lp, i_start + j].clone()
+                for j in range(W - 1)
+            ]
+            cols_k = [
+                conv_state[conv_slot_idx, lp : 2 * lp, i_start + j].clone()
+                for j in range(W - 1)
+            ]
+            cols_v = [
+                conv_state[conv_slot_idx, 2 * lp :, i_start + j].clone()
+                for j in range(W - 1)
+            ]
         else:
             s_idx = state_indices[n].item()
             conv_slot_idx = s_idx
             b_h = state[s_idx].clone().float()
 
-        for t in range(eos - bos):
+        seqlen = int(eos - bos)
+        for t in range(seqlen):
             tok = bos + t
-            qkv_out = _ref_conv1d_step(
-                mixed_qkv[tok], conv_state[conv_slot_idx], conv_weight, state_len
-            )
+            if is_spec:
+                q_out, cols_q = _ref_conv1d_step_spec(
+                    mixed_qkv[tok, :lp], cols_q, conv_weight[:lp]
+                )
+                k_out, cols_k = _ref_conv1d_step_spec(
+                    mixed_qkv[tok, lp : 2 * lp], cols_k, conv_weight[lp : 2 * lp]
+                )
+                v_out, cols_v = _ref_conv1d_step_spec(
+                    mixed_qkv[tok, 2 * lp :], cols_v, conv_weight[2 * lp :]
+                )
+                qkv_out = torch.cat([q_out, k_out, v_out])
+            else:
+                qkv_out = _ref_conv1d_step(
+                    mixed_qkv[tok], conv_state[conv_slot_idx], conv_weight, state_len
+                )
             q = qkv_out[:lp].reshape(H, K)
             k = qkv_out[lp : 2 * lp].reshape(H, K)
             v = qkv_out[2 * lp :].reshape(H, V)
@@ -166,6 +212,18 @@ def _ref_decode(
                 out[tok, hh * V : (hh + 1) * V] = (
                     o_bf16 * rstd * w * torch.sigmoid(og)
                 ).bfloat16()
+
+        if is_spec:
+            cs = conv_state[conv_slot_idx]
+            val = state_len - seqlen
+            new_cs = cs.clone()
+            for idx in range(state_len):
+                if idx + seqlen < state_len:
+                    new_cs[:, idx] = cs[:, i_start + 1 + idx]
+                else:
+                    x_tok = int(bos + (idx - val))
+                    new_cs[:, idx] = mixed_qkv[x_tok]
+            conv_state[conv_slot_idx] = new_cs
 
     return out
 

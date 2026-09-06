@@ -6,12 +6,14 @@ Performance benchmark for fused KDA decode kernel vs 3-kernel baseline.
 
 Uses triton.testing.do_bench for measurement (same as other bench files).
 Uses real Triton rmsnorm kernel (inlined from ATOM) for fair comparison.
+Includes optional --fp8 mode that adds per-token FP8 quant to both paths,
+matching the K3 production config (ptpc_fp8 online quant on o_proj input).
 
 Usage examples
 --------------
 python bench_fused_kda_decode.py
 python bench_fused_kda_decode.py --batches 1 16 64 128
-python bench_fused_kda_decode.py --Hloc 8
+python bench_fused_kda_decode.py --Hloc 12 --batches 1 4 8 32 56 72 --fp8
 """
 
 import argparse
@@ -28,6 +30,7 @@ from aiter.ops.triton.gated_delta_net.causal_conv1d_decode import (
     causal_conv1d_update_split_qkv,
 )
 from aiter.ops.triton.gated_delta_net.fused_kda_decode import fused_kda_decode
+from aiter import QuantType, get_hip_quant
 
 DEVICE = "cuda"
 D = 128
@@ -95,7 +98,86 @@ def rmsnorm_gated_bf16(x, weight, gate, eps):
     return y.reshape_as(x)
 
 
-# -- End inlined kernel --
+@triton.jit
+def _rmsnorm_gated_fp8_per_token_kernel(
+    x_ptr,
+    w_ptr,
+    g_ptr,
+    y_ptr,
+    s_ptr,
+    H,
+    eps,
+    fp8_max,
+    stride_xm,
+    stride_xh,
+    stride_g_outer,
+    stride_g_head,
+    stride_ym,
+    HEADS: tl.constexpr,
+    HEADS_POW2: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    tok = tl.program_id(0)
+    head_ids = tl.arange(0, HEADS_POW2)
+    cols = tl.arange(0, BLOCK)
+    mask = (head_ids[:, None] < HEADS) & (cols[None, :] < H)
+    h_safe = tl.where(head_ids < HEADS, head_ids, 0)
+    x_off = tok * stride_xm + h_safe[:, None] * stride_xh + cols[None, :]
+    x = tl.load(x_ptr + x_off, mask=mask, other=0.0).to(tl.float32)
+    var = tl.sum(x * x, axis=1) / H
+    rstd = 1.0 / tl.sqrt(var + eps)
+    w = tl.load(w_ptr + cols, mask=cols < H, other=0.0).to(tl.float32)
+    g_off = tok * stride_g_outer + h_safe[:, None] * stride_g_head + cols[None, :]
+    gate = tl.load(g_ptr + g_off, mask=mask, other=0.0).to(tl.float32)
+    normed = (x * rstd[:, None] * w[None, :]) * tl.sigmoid(gate)
+    amax = tl.max(tl.abs(normed))
+    scale = amax / fp8_max
+    inv = tl.where(scale > 0.0, 1.0 / scale, 0.0)
+    q = normed * inv
+    q = tl.minimum(tl.maximum(q, -fp8_max), fp8_max)
+    y_off = tok * stride_ym + h_safe[:, None] * H + cols[None, :]
+    tl.store(y_ptr + y_off, q.to(y_ptr.dtype.element_ty), mask=mask)
+    tl.store(s_ptr + tok, scale)
+
+
+def rmsnorm_gated_fp8(x, weight, gate, eps, quant_dtype=torch.float8_e4m3fn):
+    """Gated RMSNorm -> fp8 + per-token scale (matches ATOM production path)."""
+    assert x.ndim == 3
+    t, heads, H = x.shape
+    fp8_max = float(torch.finfo(quant_dtype).max)
+    x = x.contiguous()
+    out = torch.empty((t, heads * H), dtype=quant_dtype, device=x.device)
+    scale = torch.empty((t, 1), dtype=torch.float32, device=x.device)
+    if gate.ndim == 3:
+        stride_g_outer, stride_g_head = gate.stride(0), gate.stride(1)
+    else:
+        stride_g_outer, stride_g_head = gate.stride(0), 0
+    BLOCK = triton.next_power_of_2(H)
+    _rmsnorm_gated_fp8_per_token_kernel[(t,)](
+        x,
+        weight,
+        gate,
+        out,
+        scale,
+        H,
+        float(eps),
+        fp8_max,
+        x.stride(0),
+        x.stride(1),
+        stride_g_outer,
+        stride_g_head,
+        out.stride(0),
+        HEADS=heads,
+        HEADS_POW2=triton.next_power_of_2(heads),
+        BLOCK=BLOCK,
+    )
+    return out, scale
+
+
+_hip_per_token_quant = get_hip_quant(QuantType.per_Token)
+
+
+# -- End inlined kernels --
 
 
 def _make_inputs(batch, Hloc):
@@ -125,9 +207,11 @@ def _make_inputs(batch, Hloc):
 def run_benchmark(args):
     Hloc = args.Hloc
     batches = args.batches
+    use_fp8 = args.fp8
 
+    mode = "fp8" if use_fp8 else "bf16"
     header = f"{'Batch':>6}  {'3-kernel(us)':>13}  {'Fused(us)':>10}  {'Speedup':>8}"
-    print(f"\nHloc={Hloc}, D={D}, W={W}")
+    print(f"\nHloc={Hloc}, D={D}, W={W}, output={mode}")
     print(header)
     print("-" * len(header))
 
@@ -167,12 +251,15 @@ def run_benchmark(args):
                 cu_seqlens=inp["cu_seqlens"],
             )
             og3d = rearrange(inp["out_gate"][:T], "t (h d) -> t h d", d=D)
-            rmsnorm_gated_bf16(out, inp["norm_weight"], og3d, 1e-6)
+            if use_fp8:
+                rmsnorm_gated_fp8(out, inp["norm_weight"], og3d, 1e-6)
+            else:
+                rmsnorm_gated_bf16(out, inp["norm_weight"], og3d, 1e-6)
 
         def fn_fused(inp=inp):
             cs = inp["conv_state"].clone()
             ss = inp["ssm_state"].clone()
-            fused_kda_decode(
+            result = fused_kda_decode(
                 inp["mixed_qkv"],
                 cs,
                 inp["conv_weight"],
@@ -190,6 +277,8 @@ def run_benchmark(args):
                 Hloc,
                 -5.0,
             )
+            if use_fp8:
+                _hip_per_token_quant(result, quant_dtype=torch.float8_e4m3fn)
 
         t_3k = triton.testing.do_bench(fn_3k, warmup=50, rep=200) * 1000
         t_fused = triton.testing.do_bench(fn_fused, warmup=50, rep=200) * 1000
@@ -215,6 +304,11 @@ def parse_args(args=None):
         nargs="+",
         default=[1, 4, 8, 16, 32, 64, 128, 256],
         help="Batch sizes to benchmark",
+    )
+    parser.add_argument(
+        "--fp8",
+        action="store_true",
+        help="Add per-token FP8 quant (3-kernel: fused in RMSNorm; fused: standalone quant after)",
     )
     return parser.parse_args(args=args)
 

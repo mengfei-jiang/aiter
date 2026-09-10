@@ -81,6 +81,19 @@ def fused_kda_decode_unified(
         use_replay and conv_state_indices is not None
     )
 
+    # DSpark invariant: num_accepted[i] <= seq_T[i] for every request.
+    # Violated means the write-back copy reads past conv_state bounds.
+    if is_spec and num_accepted_tokens is not None:
+        seq_lens = cu_seqlens[1 : batch + 1] - cu_seqlens[:batch]
+        violators = num_accepted_tokens[:batch] > seq_lens
+        if violators.any():
+            idx = int(violators.nonzero(as_tuple=False)[0, 0])
+            raise ValueError(
+                f"num_accepted[{idx}]={num_accepted_tokens[idx].item()} > "
+                f"seq_T[{idx}]={seq_lens[idx].item()}: "
+                f"conv_state write-back would read out of bounds"
+            )
+
     out = torch.empty(T, lp, dtype=torch.bfloat16, device=device)
 
     # Conv weight strides

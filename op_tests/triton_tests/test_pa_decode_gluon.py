@@ -1064,8 +1064,8 @@ def test_pa_decode_qk192_v128_vectorized_5d(
     ps=False with context_length=256 forces a single partition. Four Q heads
     keep QUERY_SEQ_LEN_POW2=4 instead of dispatching each query separately.
     """
-    if arch_info.get_arch() not in ("gfx942", "gfx950"):
-        pytest.skip("asymmetric Gluon paged decode supports gfx942/gfx950")
+    if arch_info.get_arch() not in ("gfx942", "gfx950", "gfx1250"):
+        pytest.skip("asymmetric Gluon paged decode supports gfx942/gfx950/gfx1250")
 
     result = run_pa_gluon_test(
         context_length=context_length,
@@ -1091,8 +1091,8 @@ def test_pa_decode_qk192_v128_vectorized_5d(
 
 def test_pa_decode_qk192_v128_temporary_output():
     """Reject unsafe workspaces and retain support for reusable padded storage."""
-    if arch_info.get_arch() not in ("gfx942", "gfx950"):
-        pytest.skip("asymmetric Gluon paged decode supports gfx942/gfx950")
+    if arch_info.get_arch() not in ("gfx942", "gfx950", "gfx1250"):
+        pytest.skip("asymmetric Gluon paged decode supports gfx942/gfx950/gfx1250")
 
     query = torch.zeros((1, 16, 192), dtype=torch.bfloat16, device="cuda")
     key_cache = torch.zeros((8, 1, 24, 64, 8), dtype=query.dtype, device=query.device)

@@ -20,6 +20,14 @@ except Exception:  # noqa: BLE001
     CXX_PS_REDUCE_AVAILABLE = False
     launch_pa_decode_ps_reduce_cxx = None
 
+# gfx1250 (RDNA4) kernel
+try:
+    from aiter.ops.triton._gluon_kernels.gfx1250.attention.pa_decode import (
+        _pa_decode_gluon_gfx1250,
+    )
+except Exception:  # noqa: BLE001
+    _pa_decode_gluon_gfx1250 = None
+
 GLUON_JIT_KERNEL_ENABLED = True
 try:
     from triton.experimental import gluon
@@ -80,9 +88,14 @@ def get_cdna_version():
         return -1
 
 
+_IS_GFX1250 = (
+    arch_info.get_arch() == "gfx1250" and _pa_decode_gluon_gfx1250 is not None
+)
+
+
 def pa_decode_gluon_supports_arch() -> bool:
     """Whether the Gluon paged-decode backend supports the current GPU."""
-    return get_cdna_version() in (3, 4)
+    return get_cdna_version() in (3, 4) or _IS_GFX1250
 
 
 def get_occupancy():
@@ -4484,6 +4497,84 @@ def _paged_attention_decode_v2_with_dot_kernel_reshape_wrapper(
     KV_COMPUTE_BLOCK_SIZE = CONTEXT_PARTITION_SIZE
     # Select kernel implementation based on block size
 
+    # gfx1250 (RDNA4): use the dedicated WMMA kernel
+    if _IS_GFX1250:
+        ONE_SHOT = num_splits <= 1
+        IS_HEAD1 = num_kv_heads == 1
+        # MTP expansion for num_kv_heads=1: split query positions across grid
+        # dim 1 so more WGs fill the GPU.
+        if IS_HEAD1 and query_seq_len > 1:
+            if ONE_QUERY_GROUP_SIZE_POW2 >= 16:
+                # Branch A: group >= 16, each WG handles 1 query position
+                grid = (grid[0], query_seq_len, grid[2])
+                QUERY_SEQ_LEN_POW2 = 1
+            else:
+                # Branch B: group < 16, merge positions to fill 16 WMMA rows
+                positions_per_wg = triton.cdiv(16, ONE_QUERY_GROUP_SIZE_POW2)
+                mtp_splits = triton.cdiv(query_seq_len, positions_per_wg)
+                grid = (grid[0], mtp_splits, grid[2])
+                QUERY_SEQ_LEN_POW2 = triton.cdiv(QUERY_SEQ_LEN_POW2, mtp_splits)
+        _pa_decode_gluon_gfx1250[grid](
+            exp_sums_ptr,
+            max_logits_ptr,
+            output_ptr,
+            query_ptr,
+            key_cache_ptr,
+            value_cache_ptr,
+            block_tables_ptr,
+            context_lengths_ptr,
+            softmax_scale,
+            query_scale,
+            key_scale,
+            value_scale,
+            sinks_ptr if ONE_SHOT else None,
+            stride_max_logits_seq,
+            stride_max_logits_head,
+            stride_max_logits_part,
+            stride_output_seq,
+            stride_output_head,
+            stride_output_part,
+            stride_output_group,
+            stride_query_bs,
+            stride_query_qlen,
+            stride_query_kv_head,
+            stride_query_group_size,
+            stride_key_block,
+            stride_key_head,
+            stride_key_head_split,
+            stride_key_block_elem,
+            stride_value_block,
+            stride_value_head_size,
+            stride_value_block_elem,
+            stride_block_table_seq,
+            stride_query_scale_bs,
+            stride_query_scale_qlen,
+            stride_query_scale_kv_head,
+            kv_scale_stride_0,
+            kv_scale_stride_1,
+            query_seq_len=query_seq_len,
+            query_group_size=query_group_size,
+            head_size=HEAD_SIZE,
+            COMPUTE_TYPE=COMPUTE_TYPE,
+            QUERY_SEQ_LEN_POW2=QUERY_SEQ_LEN_POW2,
+            ONE_QUERY_GROUP_SIZE_POW2=ONE_QUERY_GROUP_SIZE_POW2,
+            HEAD_SIZE_POW2=HEAD_SIZE_POW2,
+            KV_BLOCK_SIZE=KV_BLOCK_SIZE,
+            CONTEXT_PARTITION_SIZE=CONTEXT_PARTITION_SIZE,
+            QUERY_QUANT_MODE=QUERY_QUANT_MODE,
+            KV_QUANT_MODE=KV_QUANT_MODE,
+            VALUE_TRANSPOSED=VALUE_TRANSPOSED,
+            IS_CAUSAL=IS_CAUSAL,
+            FP8_MAX_VALUE=FP8_MAX_VALUE,
+            SLIDING_WINDOW=SLIDING_WINDOW,
+            ONE_SHOT=ONE_SHOT,
+            KEY_HEAD_PADDED=KEY_HEAD_PADDED,
+            VALUE_HEAD_PADDED=VALUE_HEAD_PADDED,
+            IS_HEAD1=IS_HEAD1,
+            num_warps=4,
+        )
+        return
+
     # PS path uses the sliding-window kernel for all KV_BLOCK_SIZE values.
     # This is required for KV_BLOCK_SIZE==1024 support in PS mode.
     if PS and not (SLIDING_WINDOW > 0 and KV_BLOCK_SIZE == 1024):
@@ -4669,7 +4760,13 @@ def _paged_attention_decode_v2_reduce_kernel_wrapper(
 ):
     """Dispatch partition reduction to C++ or Triton."""
     if PS:
-        if CXX_PS_REDUCE_AVAILABLE:
+        # C++ PS reduce uses wave-level ops (ds_swizzle, ds_bpermute) that
+        # address lanes by index.  On gfx1250 (wave32) lanes 32+ don't exist,
+        # so fall back to the Triton reduce when partitions exceed 32.
+        cxx_ok = CXX_PS_REDUCE_AVAILABLE and not (
+            _IS_GFX1250 and context_partition_num > 32
+        )
+        if cxx_ok:
             try:
                 launch_pa_decode_ps_reduce_cxx(
                     output_ptr,
@@ -4905,10 +5002,10 @@ def pa_decode_gluon(
     from aiter.ops.triton.utils.types import torch_to_triton_dtype
 
     cdna_version = get_cdna_version()
-    assert cdna_version in [
-        3,
-        4,
-    ], f"pa_decode_gluon only supports gfx942 (CDNA3) and gfx950 (CDNA4) now, but got {arch_info.get_arch()}"
+    assert cdna_version in [3, 4] or _IS_GFX1250, (
+        f"pa_decode_gluon supports gfx942, gfx950 and gfx1250, "
+        f"but got {arch_info.get_arch()}"
+    )
     # Extract tensor dimensions from input tensors
     num_query_heads = query.shape[1]
     head_size = query.shape[-1]

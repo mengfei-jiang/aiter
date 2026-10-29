@@ -12,6 +12,7 @@ import pytest
 import torch
 import triton
 
+import aiter.ops.triton.gluon.pa_decode_gluon as pa_decode_gluon_module
 from aiter import dtypes, logger, per_tensor_quant, pertoken_quant
 from aiter.ops.triton.gluon.pa_decode_gluon import (
     get_recommended_splits,
@@ -1064,8 +1065,8 @@ def test_pa_decode_qk192_v128_vectorized_5d(
     ps=False with context_length=256 forces a single partition. Four Q heads
     keep QUERY_SEQ_LEN_POW2=4 instead of dispatching each query separately.
     """
-    if arch_info.get_arch() not in ("gfx942", "gfx950"):
-        pytest.skip("asymmetric Gluon paged decode supports gfx942/gfx950")
+    if arch_info.get_arch() not in ("gfx942", "gfx950", "gfx1250"):
+        pytest.skip("asymmetric Gluon paged decode supports gfx942/gfx950/gfx1250")
 
     result = run_pa_gluon_test(
         context_length=context_length,
@@ -1091,8 +1092,8 @@ def test_pa_decode_qk192_v128_vectorized_5d(
 
 def test_pa_decode_qk192_v128_temporary_output():
     """Reject unsafe workspaces and retain support for reusable padded storage."""
-    if arch_info.get_arch() not in ("gfx942", "gfx950"):
-        pytest.skip("asymmetric Gluon paged decode supports gfx942/gfx950")
+    if arch_info.get_arch() not in ("gfx942", "gfx950", "gfx1250"):
+        pytest.skip("asymmetric Gluon paged decode supports gfx942/gfx950/gfx1250")
 
     query = torch.zeros((1, 16, 192), dtype=torch.bfloat16, device="cuda")
     key_cache = torch.zeros((8, 1, 24, 64, 8), dtype=query.dtype, device=query.device)
@@ -1196,7 +1197,31 @@ def test_get_recommended_splits(monkeypatch, num_seqs, num_kv_heads, kwargs, exp
         "get_device_properties",
         lambda *a, **k: SimpleNamespace(multi_processor_count=256),
     )
+    # The expected counts are for CDNA: occupancy 2 and at most 32 splits.
+    monkeypatch.setattr(pa_decode_gluon_module, "_IS_GFX1250", False)
     assert get_recommended_splits(num_seqs, num_kv_heads, **kwargs) == expected
+
+
+@pytest.mark.parametrize(
+    "num_seqs, kwargs, expected",
+    [
+        (1, {}, 256),
+        (1, {"max_context_length": 1024}, 8),
+        (32, {"max_context_length": 8192}, 32),
+        (3, {"max_context_length": 220000}, 256),
+        (1, {"max_context_length": 131072}, 512),
+        (8, {"max_context_length": 32768, "query_length": 4}, 32),
+    ],
+)
+def test_get_recommended_splits_gfx1250(monkeypatch, num_seqs, kwargs, expected):
+    """Check the gfx1250 split counts on a GPU with 256 compute units."""
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_properties",
+        lambda *a, **k: SimpleNamespace(multi_processor_count=256),
+    )
+    monkeypatch.setattr(pa_decode_gluon_module, "_IS_GFX1250", True)
+    assert get_recommended_splits(num_seqs, 1, **kwargs) == expected
 
 
 @pytest.mark.parametrize(
@@ -1263,6 +1288,104 @@ def test_ps_recommended_splits_match_reference(kv_heads, lengths):
         probs = torch.softmax(q @ k.transpose(1, 2) * scale, dim=-1)
         reference = (probs @ v).reshape(kv_heads * group, head_size)
         torch.testing.assert_close(output[i].float(), reference, atol=2e-2, rtol=2e-2)
+
+
+def test_gfx1250_ps_reduce_is_triton(monkeypatch):
+    """gfx1250 reduces with Triton, also with more than 32 partitions.
+
+    The C++ PS reduce is replaced with a stub that fails. A gfx1250 call that
+    reaches it fails this test.
+    """
+    if arch_info.get_arch() != "gfx1250":
+        pytest.skip("gfx1250 reduce dispatch")
+
+    def cxx_reduce(*args, **kwargs):
+        raise AssertionError("gfx1250 must not use the C++ PS reduce")
+
+    monkeypatch.setattr(pa_decode_gluon_module, "CXX_PS_REDUCE_AVAILABLE", True)
+    monkeypatch.setattr(
+        pa_decode_gluon_module, "launch_pa_decode_ps_reduce_cxx", cxx_reduce
+    )
+    torch.manual_seed(0)
+    group, head_size, page, x, length, splits = 8, 128, 64, 8, 8192, 64
+    pages = triton.cdiv(length, page)
+    kwargs = {"device": "cuda", "dtype": torch.bfloat16}
+    query = torch.randn(1, group, head_size, **kwargs)
+    key_cache = torch.randn(pages, 1, head_size // x, page, x, **kwargs)
+    value_cache = torch.randn(pages, 1, page // x, head_size, x, **kwargs)
+    context_lengths = torch.tensor([length], dtype=torch.int32, device="cuda")
+    block_tables = torch.arange(pages, dtype=torch.int32, device="cuda").view(1, -1)
+    output = torch.zeros_like(query)
+    scale = head_size**-0.5
+    pa_decode_gluon(
+        output,
+        query,
+        key_cache,
+        value_cache,
+        context_lengths,
+        block_tables,
+        softmax_scale=scale,
+        query_length=1,
+        max_context_partition_num=splits,
+        ps=True,
+    )
+
+    k = key_cache.permute(1, 0, 3, 2, 4).reshape(-1, head_size).float()
+    v = value_cache.permute(1, 0, 2, 4, 3).reshape(-1, head_size).float()
+    probs = torch.softmax(query[0].float() @ k.T * scale, dim=-1)
+    torch.testing.assert_close(output[0].float(), probs @ v, atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.parametrize("sliding_window", [0, 128])
+def test_gfx1250_chooses_its_own_splits(monkeypatch, sliding_window):
+    """gfx1250 ignores a caller split count above 1 and its too-small buffers."""
+    if arch_info.get_arch() != "gfx1250":
+        pytest.skip("gfx1250 split selection")
+    launches = []
+    kernel = pa_decode_gluon_module._pa_decode_gluon_gfx1250
+    real_getitem = type(kernel).__getitem__
+    monkeypatch.setattr(
+        type(kernel),
+        "__getitem__",
+        lambda self, grid: launches.append(grid) or real_getitem(self, grid),
+    )
+    torch.manual_seed(0)
+    group, head_size, page, x, length, caller_splits = 8, 128, 64, 8, 32768, 2
+    pages = triton.cdiv(length, page)
+    kwargs = {"device": "cuda", "dtype": torch.bfloat16}
+    query = torch.randn(1, group, head_size, **kwargs)
+    key_cache = torch.randn(pages, 1, head_size // x, page, x, **kwargs)
+    value_cache = torch.randn(pages, 1, page // x, head_size, x, **kwargs)
+    context_lengths = torch.tensor([length], dtype=torch.int32, device="cuda")
+    block_tables = torch.arange(pages, dtype=torch.int32, device="cuda").view(1, -1)
+    shape = (1, 1, caller_splits, group)
+    output = torch.zeros_like(query)
+    scale = head_size**-0.5
+    pa_decode_gluon(
+        output,
+        query,
+        key_cache,
+        value_cache,
+        context_lengths,
+        block_tables,
+        softmax_scale=scale,
+        query_length=1,
+        max_context_partition_num=caller_splits,
+        exp_sums=torch.empty(shape, dtype=torch.float32, device="cuda"),
+        max_logits=torch.empty(shape, dtype=torch.float32, device="cuda"),
+        temporary_output=torch.empty((*shape, head_size), **kwargs),
+        sliding_window=sliding_window,
+        ps=True,
+    )
+    assert launches and launches[0][2] > caller_splits
+
+    k = key_cache.permute(1, 0, 3, 2, 4).reshape(-1, head_size).float()
+    v = value_cache.permute(1, 0, 2, 4, 3).reshape(-1, head_size).float()
+    if sliding_window:
+        # Decode query position is `length`; it sees keys > length - window.
+        k, v = k[length - sliding_window + 1 :], v[length - sliding_window + 1 :]
+    probs = torch.softmax(query[0].float() @ k.T * scale, dim=-1)
+    torch.testing.assert_close(output[0].float(), probs @ v, atol=2e-2, rtol=2e-2)
 
 
 @pytest.mark.parametrize(

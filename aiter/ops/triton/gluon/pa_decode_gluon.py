@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import math
 from functools import lru_cache
 
 import torch
@@ -19,6 +20,14 @@ try:
 except Exception:  # noqa: BLE001
     CXX_PS_REDUCE_AVAILABLE = False
     launch_pa_decode_ps_reduce_cxx = None
+
+# gfx1250 (RDNA4) kernel
+try:
+    from aiter.ops.triton._gluon_kernels.gfx1250.attention.pa_decode import (
+        _pa_decode_gluon_gfx1250,
+    )
+except Exception:  # noqa: BLE001
+    _pa_decode_gluon_gfx1250 = None
 
 GLUON_JIT_KERNEL_ENABLED = True
 try:
@@ -80,13 +89,31 @@ def get_cdna_version():
         return -1
 
 
+_IS_GFX1250 = arch_info.get_arch() == "gfx1250" and _pa_decode_gluon_gfx1250 is not None
+
+
 def pa_decode_gluon_supports_arch() -> bool:
     """Whether the Gluon paged-decode backend supports the current GPU."""
-    return get_cdna_version() in (3, 4)
+    return get_cdna_version() in (3, 4) or _IS_GFX1250
 
 
 def get_occupancy():
     return 2
+
+
+def _gfx1250_recommended_splits(programs, query_length, max_context_length):
+    """Splits for the gfx1250 kernel: about three programs per CU in total.
+
+    Each query position counts as a program. With a context hint, each split
+    keeps at least 128 tokens. Fitted on gfx1250 sweeps of 1 to 512 splits.
+    """
+    num_cu = torch.cuda.get_device_properties().multi_processor_count
+    target = 3 * num_cu / (programs * query_length)
+    splits = 1 << max(0, round(math.log2(max(target, 1.0))))
+    if max_context_length is None:
+        return min(splits, 256)
+    tokens_cap = 1 << max(0, (max(1, max_context_length // 128)).bit_length() - 1)
+    return min(splits, tokens_cap, 512)
 
 
 def get_recommended_splits(
@@ -97,6 +124,10 @@ def get_recommended_splits(
     query_length=1,
     max_context_length=None,
 ):
+    if _IS_GFX1250:
+        return _gfx1250_recommended_splits(
+            num_sequences * num_kv_heads, query_length, max_context_length
+        )
     props = torch.cuda.get_device_properties()
     num_sm = props.multi_processor_count * get_occupancy()
     programs = num_sequences * num_kv_heads * split_kv_blocks
@@ -4484,6 +4515,97 @@ def _paged_attention_decode_v2_with_dot_kernel_reshape_wrapper(
     KV_COMPUTE_BLOCK_SIZE = CONTEXT_PARTITION_SIZE
     # Select kernel implementation based on block size
 
+    # gfx1250: dedicated WMMA + TDM kernel. It splits the context evenly, so
+    # pa_decode_gluon always uses the PS reduce on gfx1250.
+    if _IS_GFX1250:
+        ONE_SHOT = num_splits <= 1
+        IS_HEAD1 = num_kv_heads == 1
+        if IS_HEAD1 and query_seq_len > 1:
+            # Rows (query positions x heads) per program. 16-bit compute takes
+            # up to 64 rows and reads the KV cache once for them; FP8 compute
+            # is faster with 16 rows.
+            max_rows = 16 if COMPUTE_TYPE.is_fp8() else 64
+            positions_per_program = max(1, max_rows // ONE_QUERY_GROUP_SIZE_POW2)
+            QUERY_SEQ_LEN_POW2 = min(QUERY_SEQ_LEN_POW2, positions_per_program)
+            grid = (
+                num_sequences,
+                triton.cdiv(query_seq_len, QUERY_SEQ_LEN_POW2),
+                num_splits,
+            )
+        BLOCK_M = max(16, QUERY_SEQ_LEN_POW2 * ONE_QUERY_GROUP_SIZE_POW2)
+        # A tile is a page slice, or several whole pages under 64 tokens.
+        TILE_SIZE = min(KV_BLOCK_SIZE, 128) if KV_BLOCK_SIZE >= 64 else 64
+        value_x = 16 // value_cache_ptr.dtype.itemsize if VALUE_TRANSPOSED else 1
+        _pa_decode_gluon_gfx1250[grid](
+            exp_sums_ptr,
+            max_logits_ptr,
+            output_ptr,
+            query_ptr,
+            key_cache_ptr,
+            value_cache_ptr,
+            block_tables_ptr,
+            context_lengths_ptr,
+            softmax_scale,
+            query_scale,
+            key_scale,
+            value_scale,
+            sinks_ptr if ONE_SHOT else None,
+            stride_max_logits_seq,
+            stride_max_logits_head,
+            stride_max_logits_part,
+            stride_output_seq,
+            stride_output_head,
+            stride_output_part,
+            stride_output_group,
+            stride_query_bs,
+            stride_query_qlen,
+            stride_query_kv_head,
+            stride_query_group_size,
+            # A size-1 head dim can carry any stride: TDM rows then step by block.
+            key_cache_ptr.stride(1) if num_kv_heads > 1 else key_cache_ptr.stride(0),
+            (
+                value_cache_ptr.stride(1)
+                if num_kv_heads > 1
+                else value_cache_ptr.stride(0)
+            ),
+            stride_block_table_seq,
+            stride_query_scale_bs,
+            stride_query_scale_qlen,
+            stride_query_scale_kv_head,
+            kv_scale_stride_0,
+            kv_scale_stride_1,
+            key_cache_ptr.shape[0],
+            num_kv_heads,
+            query_seq_len,
+            query_group_size,
+            HEAD_SIZE,
+            VALUE_HEAD_SIZE,
+            COMPUTE_TYPE=COMPUTE_TYPE,
+            QUERY_SEQ_LEN_POW2=QUERY_SEQ_LEN_POW2,
+            ONE_QUERY_GROUP_SIZE_POW2=ONE_QUERY_GROUP_SIZE_POW2,
+            HEAD_SIZE=HEAD_SIZE,
+            HEAD_SIZE_POW2=HEAD_SIZE_POW2,
+            VALUE_HEAD_SIZE=VALUE_HEAD_SIZE,
+            VALUE_HEAD_SIZE_POW2=VALUE_HEAD_SIZE_POW2,
+            KV_BLOCK_SIZE=KV_BLOCK_SIZE,
+            K_X=KV_16B_ELEMENT_COUNT,
+            V_X=value_x,
+            QUERY_QUANT_MODE=QUERY_QUANT_MODE,
+            KV_QUANT_MODE=KV_QUANT_MODE,
+            VALUE_TRANSPOSED=VALUE_TRANSPOSED,
+            IS_CAUSAL=IS_CAUSAL,
+            FP8_MAX_VALUE=FP8_MAX_VALUE,
+            SLIDING_WINDOW=SLIDING_WINDOW,
+            ONE_SHOT=ONE_SHOT,
+            IS_HEAD1=IS_HEAD1,
+            BLOCK_M=BLOCK_M,
+            TILE_SIZE=TILE_SIZE,
+            # Three LDS stages measured slower than two on gfx1250.
+            NUM_BUFFERS=2,
+            num_warps=4,
+        )
+        return
+
     # PS path uses the sliding-window kernel for all KV_BLOCK_SIZE values.
     # This is required for KV_BLOCK_SIZE==1024 support in PS mode.
     if PS and not (SLIDING_WINDOW > 0 and KV_BLOCK_SIZE == 1024):
@@ -4669,7 +4791,11 @@ def _paged_attention_decode_v2_reduce_kernel_wrapper(
 ):
     """Dispatch partition reduction to C++ or Triton."""
     if PS:
-        if CXX_PS_REDUCE_AVAILABLE:
+        # gfx1250 always uses the Triton reduce. Its split heuristic gives up to
+        # 512 partitions, and the C++ PS reduce is written for wave64 and at
+        # most 32 partitions. Do not route gfx1250 to a C++ reduce that does
+        # not take 512 partitions.
+        if CXX_PS_REDUCE_AVAILABLE and not _IS_GFX1250:
             try:
                 launch_pa_decode_ps_reduce_cxx(
                     output_ptr,
@@ -4897,6 +5023,11 @@ def pa_decode_gluon(
     - The validated asymmetric configuration is Q/K192-V128 on gfx942/gfx950,
       BF16 or FP8 KV, vectorized 5D page-64 caches, and query length 1 or 4,
       with full attention or sliding-window attention with sinks.
+    - On gfx1250, max_context_partition_num > 1 only selects split mode: the
+      split count comes from get_recommended_splits (and the sliding window).
+      exp_sums, max_logits and temporary_output are used when they hold that
+      many partitions; else the function allocates its own. A value of 1 keeps
+      one-shot execution.
     """
     if not GLUON_JIT_KERNEL_ENABLED:
         raise RuntimeError(
@@ -4905,10 +5036,10 @@ def pa_decode_gluon(
     from aiter.ops.triton.utils.types import torch_to_triton_dtype
 
     cdna_version = get_cdna_version()
-    assert cdna_version in [
-        3,
-        4,
-    ], f"pa_decode_gluon only supports gfx942 (CDNA3) and gfx950 (CDNA4) now, but got {arch_info.get_arch()}"
+    assert cdna_version in [3, 4] or _IS_GFX1250, (
+        f"pa_decode_gluon supports gfx942, gfx950 and gfx1250, "
+        f"but got {arch_info.get_arch()}"
+    )
     # Extract tensor dimensions from input tensors
     num_query_heads = query.shape[1]
     head_size = query.shape[-1]
@@ -4985,8 +5116,10 @@ def pa_decode_gluon(
     )
 
     one_shot = max_context_partition_num <= 1
-    ps = ps or one_shot
-    uses_persistent_kernel = ps and not (sliding_window > 0 and kv_block_size == 1024)
+    ps = ps or one_shot or _IS_GFX1250
+    uses_persistent_kernel = _IS_GFX1250 or (
+        ps and not (sliding_window > 0 and kv_block_size == 1024)
+    )
 
     if exp_sums is None:
         exp_sums = torch.empty(
@@ -5036,6 +5169,41 @@ def pa_decode_gluon(
             raise ValueError(
                 "temporary_output must have stride 1 in its last dimension"
             )
+
+    if _IS_GFX1250 and not one_shot:
+        # gfx1250 chooses its own split count; the caller's count is tuned for
+        # CDNA (at most 32). A caller count of 1 (one-shot) is kept. The
+        # caller's buffers are used if they hold enough partitions.
+        splits = get_recommended_splits(
+            batch_size, num_kv_heads, query_length=query_length
+        )
+        if sliding_window > 0:
+            # The window spans at most this many 128-token tiles.
+            splits = min(splits, triton.cdiv(sliding_window + query_length, 128) + 1)
+        if exp_sums.shape[2] < splits:
+            exp_sums = torch.empty(
+                batch_size,
+                num_kv_heads,
+                splits,
+                equivalent_query_group_size,
+                device=query.device,
+                dtype=aiter.dtypes.fp32,
+            )
+        if max_logits.shape[2] < splits:
+            max_logits = torch.empty_like(exp_sums)
+        if temporary_output.shape[2] < splits:
+            temporary_output = torch.empty(
+                batch_size,
+                num_kv_heads,
+                splits,
+                equivalent_query_group_size,
+                value_head_size,
+                device=query.device,
+                dtype=query.dtype,
+            )
+        max_context_partition_num = splits
+        one_shot = splits <= 1
+        grid = (batch_size, num_kv_heads, max_context_partition_num)
 
     # ==================== QUANTIZATION MODE CONFIGURATION ====================
     stride_query_scale_bs = 0
@@ -5102,7 +5270,12 @@ def pa_decode_gluon(
             ), f"Expected key_scale.shape[-1] == 1, but got key_scale.shape[-1]={key_scale.shape[-1]}"
             kv_quant_mode = 1
             key_scale_stride_0 = key_scale.stride(0)
-            key_scale_stride_1 = key_scale.stride(1)
+            # A size-1 head dim can carry any stride: use the block stride.
+            key_scale_stride_1 = (
+                key_scale.stride(1)
+                if key_scale.shape[1] > 1
+                else key_scale.stride(0) // max(1, num_kv_heads)
+            )
 
         # Validate KV scale shape consistency
         assert (

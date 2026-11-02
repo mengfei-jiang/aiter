@@ -4535,6 +4535,14 @@ def _paged_attention_decode_v2_with_dot_kernel_reshape_wrapper(
         BLOCK_M = max(16, QUERY_SEQ_LEN_POW2 * ONE_QUERY_GROUP_SIZE_POW2)
         # A tile is a page slice, or several whole pages under 64 tokens.
         TILE_SIZE = min(KV_BLOCK_SIZE, 128) if KV_BLOCK_SIZE >= 64 else 64
+        if (
+            COMPUTE_TYPE.is_fp8()
+            and HEAD_SIZE == HEAD_SIZE_POW2
+            and VALUE_HEAD_SIZE == VALUE_HEAD_SIZE_POW2
+        ):
+            # FP8: 128-token tiles use the K=128 WMMA for PV and spread the
+            # per-tile cost; smaller pages are gathered.
+            TILE_SIZE = 128
         value_x = 16 // value_cache_ptr.dtype.itemsize if VALUE_TRANSPOSED else 1
         _pa_decode_gluon_gfx1250[grid](
             exp_sums_ptr,

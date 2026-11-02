@@ -70,18 +70,26 @@ def _issue_tile_load(
         page = gl.load(block_tables_base + token // KV_BLOCK_SIZE)
         page_off = token % KV_BLOCK_SIZE
         row = (page * num_kv_heads + kv_head_idx).to(gl.int32)
+        # Warps 0-1 load K and warps 2-3 load V: one TDM op per warp per tile.
         gl.amd.gfx1250.tdm.async_load(
-            k_desc, [row, 0, (page_off * K_X).to(gl.int32)], k_smem.index(buf)
+            k_desc,
+            [row, 0, (page_off * K_X).to(gl.int32)],
+            k_smem.index(buf),
+            warp_used_hint=0b0011,
         )
         if VALUE_TRANSPOSED:
             gl.amd.gfx1250.tdm.async_load(
                 v_desc,
                 [row, (page_off // V_X).to(gl.int32), 0, 0],
                 v_smem.index(buf),
+                warp_used_hint=0b1100,
             )
         else:
             gl.amd.gfx1250.tdm.async_load(
-                v_desc, [row, 0, page_off.to(gl.int32)], v_smem.index(buf)
+                v_desc,
+                [row, 0, page_off.to(gl.int32)],
+                v_smem.index(buf),
+                warp_used_hint=0b1100,
             )
 
 
@@ -145,10 +153,28 @@ def _gather_kv_tile(
 
 
 @gluon.jit
-def _load_kv_scales(
+def _load_scale_pages(
     tile_idx,
     block_tables_base,
     last_page,
+    KV_QUANT_MODE: gl.constexpr,
+    KV_BLOCK_SIZE: gl.constexpr,
+    TILE_SIZE: gl.constexpr,
+):
+    # Block-table entries of a tile's tokens, for its per-token scales. They
+    # are read one tile before the scales, so the scale loads do not wait.
+    if KV_QUANT_MODE == 1:
+        SCALE_LAYOUT: gl.constexpr = gl.BlockedLayout([1], [32], [4], [0])
+        cols = tile_idx * TILE_SIZE + gl.arange(0, TILE_SIZE, layout=SCALE_LAYOUT)
+        return gl.load(block_tables_base + gl.minimum(cols // KV_BLOCK_SIZE, last_page))
+    else:
+        return 0
+
+
+@gluon.jit
+def _load_kv_scales(
+    tile_idx,
+    pages,
     context_length,
     key_scale,
     value_scale,
@@ -158,30 +184,31 @@ def _load_kv_scales(
     KV_QUANT_MODE: gl.constexpr,
     KV_BLOCK_SIZE: gl.constexpr,
     TILE_SIZE: gl.constexpr,
-    QK_LAYOUT: gl.constexpr,
 ):
-    # Per-token K/V scales of one tile. Other quant modes return dummies.
+    # Issue the coalesced per-token K/V scale loads of a tile. The caller
+    # converts them to the score layout one tile later, when they have arrived.
     if KV_QUANT_MODE == 1:
-        # Coalesced 1D loads, then one layout conversion to the score columns.
         SCALE_LAYOUT: gl.constexpr = gl.BlockedLayout([1], [32], [4], [0])
-        tile_start = tile_idx * TILE_SIZE
-        cols = tile_start + gl.arange(0, TILE_SIZE, layout=SCALE_LAYOUT)
+        cols = tile_idx * TILE_SIZE + gl.arange(0, TILE_SIZE, layout=SCALE_LAYOUT)
         col_valid = cols < context_length
-        if TILE_SIZE <= KV_BLOCK_SIZE:
-            # The tile is inside one page: one block-table read.
-            pages = gl.load(block_tables_base + tile_start // KV_BLOCK_SIZE).to(
-                gl.int64
-            )
-        else:
-            page_slot = gl.minimum(cols // KV_BLOCK_SIZE, last_page)
-            pages = gl.load(block_tables_base + page_slot).to(gl.int64)
         scale_offs = (
-            pages * kv_scale_stride_0
+            pages.to(gl.int64) * kv_scale_stride_0
             + kv_head_idx * kv_scale_stride_1
             + cols % KV_BLOCK_SIZE
         )
         k_scales = gl.load(key_scale + scale_offs, mask=col_valid, other=0.0)
         v_scales = gl.load(value_scale + scale_offs, mask=col_valid, other=0.0)
+        return k_scales, v_scales
+    else:
+        return 0.0, 0.0
+
+
+@gluon.jit
+def _scales_to_columns(
+    k_scales, v_scales, KV_QUANT_MODE: gl.constexpr, QK_LAYOUT: gl.constexpr
+):
+    # Convert loaded per-token scales to the column layout of the scores.
+    if KV_QUANT_MODE == 1:
         COL_LAYOUT: gl.constexpr = gl.SliceLayout(0, QK_LAYOUT)
         return (
             gl.convert_layout(k_scales.to(gl.float32), COL_LAYOUT),
@@ -265,9 +292,11 @@ def _process_tile(
         gl.zeros([BLOCK_M, TILE_SIZE], dtype=gl.float32, layout=QK_LAYOUT),
     )
 
-    scores = scores * qk_scale
     if KV_QUANT_MODE == 1:
-        scores = scores * tile_k_scale[None, :]
+        # One multiply per score: fold qk_scale into the per-column K scale.
+        scores = scores * (tile_k_scale * qk_scale)[None, :]
+    else:
+        scores = scores * qk_scale
     if QUERY_QUANT_MODE == 1:
         scores = scores * per_token_q_scale[:, None]
 
@@ -645,6 +674,9 @@ def _pa_decode_gluon_gfx1250(
                     V_SMEM_LAYOUT,
                 )
 
+        # TDM ops each warp issues per tile: a gather is issued by all warps.
+        TDM_OPS: gl.constexpr = 2 if KV_GATHER else 1
+
         # ==================== Prologue: NUM_BUFFERS tiles in flight ====================
         for j in gl.static_range(NUM_BUFFERS):
             if j < num_tiles:
@@ -653,22 +685,66 @@ def _pa_decode_gluon_gfx1250(
                     block_tables_base, last_page, num_kv_heads, kv_head_idx,
                     KV_BLOCK_SIZE, TILE_SIZE, K_X, V_X, VALUE_TRANSPOSED, KV_GATHER,
                 )  # fmt: skip
-        k_scales, v_scales = _load_kv_scales(
-            split_tile_start, block_tables_base, last_page, context_length, key_scale, value_scale,
-                kv_scale_stride_0, kv_scale_stride_1, kv_head_idx, KV_QUANT_MODE,
-                KV_BLOCK_SIZE, TILE_SIZE, QK_LAYOUT,
-        )  # fmt: skip
+        # Per-token scales: page ids two tiles ahead, scale loads one tile
+        # ahead, conversion when the tile is processed.
+        scale_pages = _load_scale_pages(
+            split_tile_start,
+            block_tables_base,
+            last_page,
+            KV_QUANT_MODE,
+            KV_BLOCK_SIZE,
+            TILE_SIZE,
+        )
+        k_raw, v_raw = _load_kv_scales(
+            split_tile_start,
+            scale_pages,
+            context_length,
+            key_scale,
+            value_scale,
+            kv_scale_stride_0,
+            kv_scale_stride_1,
+            kv_head_idx,
+            KV_QUANT_MODE,
+            KV_BLOCK_SIZE,
+            TILE_SIZE,
+        )
+        scale_pages = _load_scale_pages(
+            split_tile_start + 1,
+            block_tables_base,
+            last_page,
+            KV_QUANT_MODE,
+            KV_BLOCK_SIZE,
+            TILE_SIZE,
+        )
 
         # ==================== Main loop: the next NUM_BUFFERS - 1 tiles are in flight ====================
         for i in range(num_tiles - (NUM_BUFFERS - 1)):
             tile_idx = split_tile_start + i
-            # Prefetch the scales of the next tile; they hide behind this tile.
-            k_scales_next, v_scales_next = _load_kv_scales(
-                tile_idx + 1, block_tables_base, last_page, context_length, key_scale, value_scale,
-                kv_scale_stride_0, kv_scale_stride_1, kv_head_idx, KV_QUANT_MODE,
-                KV_BLOCK_SIZE, TILE_SIZE, QK_LAYOUT,
-            )  # fmt: skip
-            gl.amd.gfx1250.tdm.async_wait(2 * (NUM_BUFFERS - 1))
+            k_scales, v_scales = _scales_to_columns(
+                k_raw, v_raw, KV_QUANT_MODE, QK_LAYOUT
+            )
+            k_raw, v_raw = _load_kv_scales(
+                tile_idx + 1,
+                scale_pages,
+                context_length,
+                key_scale,
+                value_scale,
+                kv_scale_stride_0,
+                kv_scale_stride_1,
+                kv_head_idx,
+                KV_QUANT_MODE,
+                KV_BLOCK_SIZE,
+                TILE_SIZE,
+            )
+            scale_pages = _load_scale_pages(
+                tile_idx + 2,
+                block_tables_base,
+                last_page,
+                KV_QUANT_MODE,
+                KV_BLOCK_SIZE,
+                TILE_SIZE,
+            )
+            gl.amd.gfx1250.tdm.async_wait(TDM_OPS * (NUM_BUFFERS - 1))
             m_i, l_i, acc = _process_tile(
                 tile_idx, i % NUM_BUFFERS, None, None, k_scales, v_scales, q_dot,
                 m_i, l_i, acc, k_smem, v_smem, block_tables_base, last_page, context_length,
@@ -686,19 +762,36 @@ def _pa_decode_gluon_gfx1250(
                     v_smem, block_tables_base, last_page, num_kv_heads, kv_head_idx,
                     KV_BLOCK_SIZE, TILE_SIZE, K_X, V_X, VALUE_TRANSPOSED, KV_GATHER,
                 )  # fmt: skip
-            k_scales = k_scales_next
-            v_scales = v_scales_next
 
         # ==================== Epilogue: the last NUM_BUFFERS - 1 tiles ====================
         for j in gl.static_range(NUM_BUFFERS - 1):
             i = num_tiles - (NUM_BUFFERS - 1) + j
             if i >= 0:
-                k_scales, v_scales = _load_kv_scales(
-                    split_tile_start + i, block_tables_base, last_page, context_length, key_scale, value_scale,
-                kv_scale_stride_0, kv_scale_stride_1, kv_head_idx, KV_QUANT_MODE,
-                KV_BLOCK_SIZE, TILE_SIZE, QK_LAYOUT,
-                )  # fmt: skip
-                gl.amd.gfx1250.tdm.async_wait(2 * (NUM_BUFFERS - 2 - j))
+                k_scales, v_scales = _scales_to_columns(
+                    k_raw, v_raw, KV_QUANT_MODE, QK_LAYOUT
+                )
+                k_raw, v_raw = _load_kv_scales(
+                    split_tile_start + i + 1,
+                    scale_pages,
+                    context_length,
+                    key_scale,
+                    value_scale,
+                    kv_scale_stride_0,
+                    kv_scale_stride_1,
+                    kv_head_idx,
+                    KV_QUANT_MODE,
+                    KV_BLOCK_SIZE,
+                    TILE_SIZE,
+                )
+                scale_pages = _load_scale_pages(
+                    split_tile_start + i + 2,
+                    block_tables_base,
+                    last_page,
+                    KV_QUANT_MODE,
+                    KV_BLOCK_SIZE,
+                    TILE_SIZE,
+                )
+                gl.amd.gfx1250.tdm.async_wait(TDM_OPS * (NUM_BUFFERS - 2 - j))
                 # The last tile can hold slots past the context: mask V.
                 m_i, l_i, acc = _process_tile(
                     split_tile_start + i, i % NUM_BUFFERS, None, None, k_scales,
@@ -722,17 +815,42 @@ def _pa_decode_gluon_gfx1250(
             value_head_size, HEAD_SIZE_POW2, VALUE_HEAD_SIZE_POW2,
             KV_BLOCK_SIZE, TILE_SIZE, K_X, V_X, VALUE_TRANSPOSED,
         )  # fmt: skip
-        k_scales_next, v_scales_next = _load_kv_scales(
-            split_tile_start, block_tables_base, last_page, context_length, key_scale, value_scale,
-                kv_scale_stride_0, kv_scale_stride_1, kv_head_idx, KV_QUANT_MODE,
-                KV_BLOCK_SIZE, TILE_SIZE, QK_LAYOUT,
-        )  # fmt: skip
+        scale_pages = _load_scale_pages(
+            split_tile_start,
+            block_tables_base,
+            last_page,
+            KV_QUANT_MODE,
+            KV_BLOCK_SIZE,
+            TILE_SIZE,
+        )
+        k_raw, v_raw = _load_kv_scales(
+            split_tile_start,
+            scale_pages,
+            context_length,
+            key_scale,
+            value_scale,
+            kv_scale_stride_0,
+            kv_scale_stride_1,
+            kv_head_idx,
+            KV_QUANT_MODE,
+            KV_BLOCK_SIZE,
+            TILE_SIZE,
+        )
+        scale_pages = _load_scale_pages(
+            split_tile_start + 1,
+            block_tables_base,
+            last_page,
+            KV_QUANT_MODE,
+            KV_BLOCK_SIZE,
+            TILE_SIZE,
+        )
         for i in range(num_tiles):
             tile_idx = split_tile_start + i
             k_cur = k_next
             v_cur = v_next
-            k_scales = k_scales_next
-            v_scales = v_scales_next
+            k_scales, v_scales = _scales_to_columns(
+                k_raw, v_raw, KV_QUANT_MODE, QK_LAYOUT
+            )
             next_tile = gl.minimum(tile_idx + 1, split_tile_end - 1)
             k_next, v_next = _gather_kv_tile(
                 next_tile * TILE_SIZE, key_cache_ptr, value_cache_ptr,
@@ -741,11 +859,27 @@ def _pa_decode_gluon_gfx1250(
                 value_head_size, HEAD_SIZE_POW2, VALUE_HEAD_SIZE_POW2,
                 KV_BLOCK_SIZE, TILE_SIZE, K_X, V_X, VALUE_TRANSPOSED,
             )  # fmt: skip
-            k_scales_next, v_scales_next = _load_kv_scales(
-                next_tile, block_tables_base, last_page, context_length, key_scale, value_scale,
-                kv_scale_stride_0, kv_scale_stride_1, kv_head_idx, KV_QUANT_MODE,
-                KV_BLOCK_SIZE, TILE_SIZE, QK_LAYOUT,
-            )  # fmt: skip
+            k_raw, v_raw = _load_kv_scales(
+                tile_idx + 1,
+                scale_pages,
+                context_length,
+                key_scale,
+                value_scale,
+                kv_scale_stride_0,
+                kv_scale_stride_1,
+                kv_head_idx,
+                KV_QUANT_MODE,
+                KV_BLOCK_SIZE,
+                TILE_SIZE,
+            )
+            scale_pages = _load_scale_pages(
+                tile_idx + 2,
+                block_tables_base,
+                last_page,
+                KV_QUANT_MODE,
+                KV_BLOCK_SIZE,
+                TILE_SIZE,
+            )
             m_i, l_i, acc = _process_tile(
                 tile_idx, 0, gl.convert_layout(k_cur, DOT_K_LAYOUT),
                 gl.convert_layout(v_cur, DOT_V_LAYOUT), k_scales, v_scales, q_dot,
